@@ -1,0 +1,479 @@
+---
+title: "`r paste0(params$experiment_name, ' — Expression vs Selection')`"
+author: ""
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+    code_folding: hide
+    df_print: paged
+params:
+  # ── Experiment identity ────────────────────────────────────────────────────
+  experiment_name: "Experiment"
+  count_file: ""                 # absolute path to count TSV
+  # ── DESeq2 design ─────────────────────────────────────────────────────────
+  control_condition: ""          # reference level (must appear in sample_conditions)
+  sample_conditions: !r c()     # character vector — one element per sample column
+  contrasts: !r list()          # named list: treatment_cond → reference_cond
+                                 # if empty, auto: every unique condition vs control
+  # ── MKT inputs (from branch_specific_MKT/render_analysis.R) ───────────────
+  species_output_dirs: !r list() # named list: label → output_dir
+  # ── Candidate gene set ─────────────────────────────────────────────────────
+  # "bs_impMKT" = branch-specific imputed MKT candidates only
+  # "bs_mkt"    = branch-specific standard MKT candidates only
+  # "bs_any"    = union of bs_impMKT and bs_mkt (recommended)
+  # "any"       = union of all 4 MKT tests
+  candidate_type: "bs_any"
+  # ── DE thresholds ──────────────────────────────────────────────────────────
+  lfc_threshold: 0.5            # |log2FC| threshold for up/down classification
+  padj_threshold: 0.05          # BH-adjusted p-value threshold
+  # ── Output ─────────────────────────────────────────────────────────────────
+  output_dir: "results/expression"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  cache   = FALSE,
+  echo    = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width  = 9,
+  fig.height = 5
+)
+```
+
+```{r packages, include=FALSE}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(DESeq2)
+  library(patchwork)
+  library(kableExtra)
+})
+```
+
+```{r helpers, include=FALSE}
+# ── MKT filter (branch-specific analyzability) ────────────────────────────────
+mk_filter_bs <- function(df) {
+  df %>% filter(
+    !is.na(num_pol_NS) & num_pol_NS >= 1,
+    !is.na(num_pol_S)  & num_pol_S  >= 1,
+    !is.na(Dn_branch_specific) & Dn_branch_specific >= 1,
+    !is.na(Ds_branch_specific) & Ds_branch_specific >= 1,
+    (num_pol_NS + num_pol_S) >= 5
+  )
+}
+
+# ── Load and classify genes per species ───────────────────────────────────────
+load_species_genes <- function(output_dir, candidate_type) {
+  f <- file.path(output_dir, "branch_specific_MKT_results.tsv")
+  if (!file.exists(f))
+    stop("File not found: ", f,
+         "\n  → Run branch_specific_MKT/render_analysis.R first.")
+
+  mkt       <- read_tsv(f, show_col_types = FALSE)
+  analyzable <- mk_filter_bs(mkt)
+
+  get_positive_flag <- function(df, type) {
+    switch(type,
+      bs_impMKT = df$pos_branch_specific_impMKT %in% TRUE,
+      bs_mkt    = df$pos_branch_specific_MKT    %in% TRUE,
+      bs_any    = (df$pos_branch_specific_impMKT %in% TRUE) |
+                  (df$pos_branch_specific_MKT    %in% TRUE),
+      any       = (df$pos_standard_MKT           %in% TRUE) |
+                  (df$pos_standard_impMKT         %in% TRUE) |
+                  (df$pos_branch_specific_MKT     %in% TRUE) |
+                  (df$pos_branch_specific_impMKT  %in% TRUE),
+      stop("Unknown candidate_type: ", type)
+    )
+  }
+
+  is_pos <- get_positive_flag(analyzable, candidate_type)
+
+  clean_ids <- function(ids) {
+    str_remove(na.omit(unique(ids)), "\\.[0-9]+$")
+  }
+
+  list(
+    positive    = tibble(id = clean_ids(analyzable$aestivum_ortholog[is_pos])),
+    neutral     = tibble(id = clean_ids(analyzable$aestivum_ortholog[!is_pos])),
+    n_analyzable = nrow(analyzable)
+  )
+}
+
+# ── Fisher test: selected vs neutral for one direction ─────────────────────────
+fisher_one_direction <- function(all_results, pos_ids, neu_ids,
+                                  lfc_thresh, padj_thresh, direction) {
+  is_up   <- direction == "up"
+  dir_lbl <- if (is_up) "upregulated" else "downregulated"
+
+  summarise_de <- function(ids) {
+    all_results %>%
+      filter(id %in% ids) %>%
+      group_by(condition) %>%
+      summarise(
+        n_total = n(),
+        n_dir   = sum(
+          padj < padj_thresh & !is.na(padj) &
+          (if (is_up) log2FoldChange > lfc_thresh
+           else        log2FoldChange < -lfc_thresh),
+          na.rm = TRUE
+        ),
+        .groups = "drop"
+      )
+  }
+
+  s_pos <- summarise_de(pos_ids)
+  s_neu <- summarise_de(neu_ids)
+
+  purrr::map_dfr(s_pos$condition, function(cond) {
+    r_pos <- s_pos %>% filter(condition == cond)
+    r_neu <- s_neu %>% filter(condition == cond)
+    if (nrow(r_neu) == 0) return(NULL)
+
+    mat <- matrix(
+      c(r_pos$n_dir,  r_pos$n_total - r_pos$n_dir,
+        r_neu$n_dir,  r_neu$n_total - r_neu$n_dir),
+      nrow = 2, byrow = TRUE,
+      dimnames = list(
+        Selection  = c("Selected", "Neutral"),
+        Expression = c(dir_lbl, paste0("not_", dir_lbl))
+      )
+    )
+    ft    <- fisher.test(mat, alternative = "two.sided")
+    stars <- case_when(
+      ft$p.value < 0.001 ~ "***",
+      ft$p.value < 0.01  ~ "**",
+      ft$p.value < 0.05  ~ "*",
+      TRUE               ~ "ns"
+    )
+    tibble(
+      condition    = cond,
+      direction    = dir_lbl,
+      n_pos        = r_pos$n_total,
+      n_dir_pos    = r_pos$n_dir,
+      n_neu        = r_neu$n_total,
+      n_dir_neu    = r_neu$n_dir,
+      prop_pos     = r_pos$n_dir / r_pos$n_total,
+      prop_neu     = r_neu$n_dir / r_neu$n_total,
+      odds_ratio   = unname(ft$estimate),
+      p_value      = ft$p.value,
+      stars        = stars
+    )
+  })
+}
+
+# ── Bar-plot for one direction ─────────────────────────────────────────────────
+plot_de_bars <- function(ft_df, sp_label, lfc_thresh, padj_thresh) {
+  if (nrow(ft_df) == 0)
+    return(ggplot() + theme_void() + labs(title = paste(sp_label, "— no data")))
+
+  dir_lbl <- unique(ft_df$direction)
+  df_long  <- ft_df %>%
+    select(condition, prop_pos, prop_neu) %>%
+    pivot_longer(c(prop_pos, prop_neu), names_to = "category", values_to = "proportion")
+
+  annot <- ft_df %>%
+    filter(stars != "ns") %>%
+    left_join(
+      df_long %>%
+        group_by(condition) %>%
+        summarise(y_top = max(proportion, na.rm = TRUE) * 1.15, .groups = "drop"),
+      by = "condition"
+    )
+
+  ggplot(df_long, aes(x = condition, y = proportion, fill = category)) +
+    geom_col(position = position_dodge(0.9), width = 0.8) +
+    geom_text(
+      data        = annot,
+      aes(x = condition, y = y_top, label = stars),
+      inherit.aes = FALSE, size = 5
+    ) +
+    scale_fill_manual(
+      values = c(prop_pos = "firebrick3", prop_neu = "steelblue3"),
+      labels = c(prop_pos = "Positive selection", prop_neu = "Neutral")
+    ) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                       expand = expansion(mult = c(0, 0.15))) +
+    labs(
+      title = sprintf(
+        "%s — %s (|LFC| > %.1f, padj < %.2f)",
+        sp_label, dir_lbl, lfc_thresh, padj_thresh
+      ),
+      y    = "Proportion of DE genes",
+      x    = NULL,
+      fill = "Gene category"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      axis.text.x     = element_text(angle = 45, hjust = 1, vjust = 1),
+      legend.position = "bottom",
+      plot.title      = element_text(size = 11, face = "bold")
+    )
+}
+```
+
+
+# Experiment: `r params$experiment_name`
+
+**Candidate type:** `r params$candidate_type`
+| **|LFC| threshold:** `r params$lfc_threshold`
+| **padj threshold:** `r params$padj_threshold`
+| **Control:** `r params$control_condition`
+
+---
+
+## 1. Load expression data
+
+```{r load-counts}
+if (!nzchar(params$count_file))
+  stop("params$count_file is empty. Set it in render_expression.R.")
+if (!file.exists(params$count_file))
+  stop("Count file not found: ", params$count_file)
+
+expr_raw         <- read_tsv(params$count_file, show_col_types = FALSE)
+colnames(expr_raw)[1] <- "id"
+
+cat(sprintf("Count file   : %s\n", basename(params$count_file)))
+cat(sprintf("Genes (rows) : %d\n", nrow(expr_raw)))
+cat(sprintf("Samples      : %d\n", ncol(expr_raw) - 1))
+```
+
+## 2. Build count matrix
+
+```{r count-matrix}
+count_matrix <- expr_raw %>%
+  tibble::column_to_rownames("id") %>%
+  as.matrix() %>%
+  round()
+```
+
+## 3. Experimental design
+
+```{r coldata}
+if (length(params$sample_conditions) == 0)
+  stop("params$sample_conditions is empty. Set it in render_expression.R.")
+if (length(params$sample_conditions) != ncol(count_matrix))
+  stop(sprintf(
+    "sample_conditions length (%d) != number of count matrix columns (%d).",
+    length(params$sample_conditions), ncol(count_matrix)
+  ))
+
+coldata <- data.frame(
+  condition = factor(params$sample_conditions),
+  row.names = colnames(count_matrix)
+)
+
+if (nzchar(params$control_condition))
+  coldata$condition <- relevel(coldata$condition, ref = params$control_condition)
+
+stopifnot(all(colnames(count_matrix) == rownames(coldata)))
+coldata
+```
+
+## 4. DESeq2 differential expression
+
+```{r deseq2, results='hide'}
+dds <- DESeqDataSetFromMatrix(
+  countData = count_matrix,
+  colData   = coldata,
+  design    = ~condition
+)
+dds <- DESeq(dds)
+```
+
+### Contrasts
+
+```{r contrasts}
+# Derive contrasts: use params$contrasts if provided, else all conditions vs control
+if (length(params$contrasts) > 0) {
+  .contrasts <- params$contrasts
+} else {
+  if (!nzchar(params$control_condition))
+    stop("Set params$control_condition when params$contrasts is empty.")
+  .other_conds <- setdiff(levels(coldata$condition), params$control_condition)
+  .contrasts <- setNames(
+    as.list(rep(params$control_condition, length(.other_conds))),
+    .other_conds
+  )
+}
+
+extract_results <- function(dds, treatment, reference) {
+  tryCatch(
+    as.data.frame(results(dds, contrast = c("condition", treatment, reference))) %>%
+      tibble::rownames_to_column("id") %>%
+      mutate(condition = treatment) %>%
+      select(id, condition, baseMean, log2FoldChange, lfcSE, stat, pvalue, padj),
+    error = function(e) {
+      warning(sprintf("Contrast '%s vs %s' failed: %s", treatment, reference, e$message))
+      NULL
+    }
+  )
+}
+
+all_results <- bind_rows(purrr::imap(.contrasts, ~ extract_results(dds, .y, .x)))
+
+cat(sprintf("Conditions tested  : %d\n", length(.contrasts)))
+cat(sprintf("Total gene-results : %d\n", nrow(all_results)))
+cat(sprintf("Genes with padj    : %d\n", sum(!is.na(all_results$padj))))
+```
+
+---
+
+## 5. Per-species enrichment analysis
+
+Gene sets are derived from `branch_specific_MKT_results.tsv` in each species output directory.
+T. *aestivum* orthologs (`aestivum_ortholog` column) are used to map focal-species genes to
+expression data.
+
+```{r per-species, results='asis', fig.show='asis', fig.width=9, fig.height=5}
+dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+
+all_summaries    <- list()
+species_genes_cache <- list()
+
+for (.sp in names(params$species_output_dirs)) {
+  cat(sprintf("\n\n### %s\n\n", .sp))
+
+  # Load gene sets
+  .genes <- tryCatch(
+    load_species_genes(params$species_output_dirs[[.sp]], params$candidate_type),
+    error = function(e) { cat("**ERROR:**", e$message, "\n"); NULL }
+  )
+  if (is.null(.genes)) next
+  species_genes_cache[[.sp]] <- .genes
+
+  .n_pos <- nrow(.genes$positive)
+  .n_neu <- nrow(.genes$neutral)
+  .n_in_expr_pos <- sum(.genes$positive$id %in% all_results$id)
+  .n_in_expr_neu <- sum(.genes$neutral$id  %in% all_results$id)
+
+  cat(sprintf(
+    "**Analyzable:** %d | **Positive candidates:** %d (%d matched to expression data) | **Neutral:** %d (%d matched)\n\n",
+    .genes$n_analyzable, .n_pos, .n_in_expr_pos, .n_neu, .n_in_expr_neu
+  ))
+
+  if (.n_in_expr_pos == 0) {
+    cat("*No positive candidates overlap expression data — skipping species.*\n")
+    next
+  }
+
+  # Fisher tests
+  .ft_up   <- fisher_one_direction(
+    all_results, .genes$positive$id, .genes$neutral$id,
+    params$lfc_threshold, params$padj_threshold, "up"
+  )
+  .ft_down <- fisher_one_direction(
+    all_results, .genes$positive$id, .genes$neutral$id,
+    params$lfc_threshold, params$padj_threshold, "down"
+  )
+
+  # Combined result table
+  .ft_all <- bind_rows(.ft_up, .ft_down)
+  if (nrow(.ft_all) > 0) {
+    print(
+      kable(.ft_all,
+            digits = 4, caption = sprintf("%s — Fisher test results", .sp)) %>%
+        kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+    )
+    cat("\n\n")
+  }
+
+  # Plots
+  if (nrow(.ft_up) > 0) {
+    print(plot_de_bars(.ft_up,   .sp, params$lfc_threshold, params$padj_threshold))
+    cat("\n\n")
+  }
+  if (nrow(.ft_down) > 0) {
+    print(plot_de_bars(.ft_down, .sp, params$lfc_threshold, params$padj_threshold))
+    cat("\n\n")
+  }
+
+  # Save per-species results
+  .out_file <- file.path(
+    params$output_dir,
+    sprintf("%s_%s_fisher_tests.tsv",
+            params$experiment_name, gsub("[^A-Za-z0-9]", "_", .sp))
+  )
+  write_tsv(.ft_all, .out_file)
+
+  # Accumulate for cross-species summary
+  all_summaries[[.sp]] <- .ft_all %>%
+    mutate(species = .sp, n_positive_candidates = .n_pos, n_neutral = .n_neu)
+}
+```
+
+---
+
+## 6. Cross-species summary
+
+```{r cross-species-summary, results='asis'}
+if (length(all_summaries) > 1) {
+  .summary_tbl <- bind_rows(all_summaries) %>%
+    select(species, condition, direction, n_pos, n_dir_pos, prop_pos,
+           n_neu, n_dir_neu, prop_neu, odds_ratio, p_value, stars) %>%
+    arrange(condition, direction, species)
+
+  print(
+    kable(.summary_tbl,
+          digits = 4,
+          caption = "Cross-species Fisher test summary") %>%
+      kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+      column_spec(ncol(.summary_tbl), bold = TRUE)
+  )
+
+  write_tsv(.summary_tbl,
+            file.path(params$output_dir,
+                      paste0(params$experiment_name, "_cross_species_summary.tsv")))
+} else {
+  cat("*(only one species — cross-species table not generated)*\n")
+}
+```
+
+---
+
+## 7. Significant DE genes in selected candidates
+
+```{r sig-genes-table}
+if (length(species_genes_cache) > 0) {
+  .sp1    <- names(species_genes_cache)[1]
+  .genes1 <- species_genes_cache[[.sp1]]
+
+  .sig_selected <- all_results %>%
+    filter(
+      id %in% .genes1$positive$id,
+      !is.na(padj), padj < params$padj_threshold
+    ) %>%
+    arrange(padj) %>%
+    head(50)
+
+  if (nrow(.sig_selected) > 0) {
+    cat(sprintf("Top significant DE genes in %s positive candidates:\n\n", .sp1))
+    print(
+      kable(.sig_selected, digits = 4) %>%
+        kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+    )
+  } else {
+    cat("*No significant DE genes found among positive candidates.*\n")
+  }
+}
+```
+
+---
+
+## Session info
+
+```{r session-info}
+cat(sprintf("Experiment   : %s\n", params$experiment_name))
+cat(sprintf("Count file   : %s\n", basename(params$count_file)))
+cat(sprintf("Candidate    : %s\n", params$candidate_type))
+cat(sprintf("Control      : %s\n", params$control_condition))
+cat(sprintf("Species      : %s\n", paste(names(params$species_output_dirs), collapse = ", ")))
+cat(sprintf("Output dir   : %s\n", params$output_dir))
+cat(sprintf("Date         : %s\n", Sys.Date()))
+sessionInfo()
+```

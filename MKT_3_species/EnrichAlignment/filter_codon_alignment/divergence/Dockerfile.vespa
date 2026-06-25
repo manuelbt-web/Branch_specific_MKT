@@ -1,0 +1,87 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# Dockerfile.vespa
+# =============================================================================
+# Builds a minimal container with VESPA running on Python 2.7.
+# VESPA (Versatile Evolutionary Sequence Protein Annotator) requires Python 2.7,
+# which is end-of-life and no longer installable via conda-forge alone; this
+# container is the recommended way to run it on modern HPC systems.
+#
+# REQUIREMENTS
+#   Docker >= 20.10 (or Singularity/Apptainer >= 3.7 for HPC)
+#
+# BUILD
+#   docker build -f Dockerfile.vespa -t vespa:latest .
+#
+#   # Custom VESPA branch or fork:
+#   docker build -f Dockerfile.vespa \
+#                --build-arg VESPA_REPO=https://github.com/aewebb80/VESPA.git \
+#                --build-arg VESPA_REF=master \
+#                -t vespa:latest .
+#
+# RUN — interactive (mount current directory as /data)
+#   docker run --rm -it -v "$(pwd)":/data -w /data vespa:latest bash
+#
+# RUN — single VESPA command
+#   docker run --rm \
+#       -v "$(pwd)":/data \
+#       -w /data \
+#       vespa:latest \
+#       infer_genetree -input=gene.fasta -species_tree=species_tree.txt
+#
+# SINGULARITY/APPTAINER (on HPC where Docker is unavailable)
+#   # Build locally then transfer, OR build directly on a machine with Docker:
+#   singularity build vespa.sif docker-daemon://vespa:latest
+#   # OR pull from a registry:
+#   singularity build vespa.sif docker://your_registry/vespa:latest
+#
+#   # Run via Singularity:
+#   singularity exec --bind "$(pwd)":/data vespa.sif \
+#       infer_genetree -input=gene.fasta -species_tree=species_tree.txt
+#
+#   # In gene_tree.sh, set:
+#   #   --singularity-image /path/to/vespa.sif
+# =============================================================================
+
+ARG MAMBAORG_VERSION=1.5.8
+FROM mambaorg/micromamba:${MAMBAORG_VERSION}
+
+# ── Build-time arguments ───────────────────────────────────────────────────────
+ARG VESPA_REPO=https://github.com/aewebb80/VESPA.git
+ARG VESPA_REF=master
+
+# ── System packages ────────────────────────────────────────────────────────────
+USER root
+RUN apt-get update -qq \
+    && DEBIAN_FRONTEND=noninteractive \
+       apt-get install -qq --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Python 2.7 conda environment ──────────────────────────────────────────────
+# python2 is no longer solvable from conda-forge alone, so use defaults first.
+ENV PY2_ENV=vespa_py27
+RUN micromamba create -y -n "${PY2_ENV}" \
+        -c defaults \
+        -c conda-forge \
+        python=2.7.18 \
+        "setuptools<45" \
+    && micromamba clean --all --yes
+
+# ── Python 2.7-compatible dependencies ────────────────────────────────────────
+# dendropy 4.4.0 is the last release supporting Python 2.7.
+RUN /opt/conda/envs/${PY2_ENV}/bin/pip install --no-cache-dir "dendropy==4.4.0"
+
+# ── Clone VESPA ───────────────────────────────────────────────────────────────
+ENV VESPA_HOME=/opt/vespa
+RUN git clone --depth 1 --branch "${VESPA_REF}" "${VESPA_REPO}" "${VESPA_HOME}"
+
+# ── Thin wrapper: `vespa <command> [args...]` ──────────────────────────────────
+RUN printf '#!/bin/sh\nexec /opt/conda/envs/vespa_py27/bin/python /opt/vespa/vespa.py "$@"\n' \
+      > /usr/local/bin/vespa \
+    && chmod +x /usr/local/bin/vespa
+
+# ── Default working directory (mount your data here) ──────────────────────────
+WORKDIR /data
+
+ENTRYPOINT ["/usr/local/bin/vespa"]
+CMD ["--help"]

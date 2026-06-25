@@ -1,0 +1,1076 @@
+---
+title: "McDonald-Kreitman Test — Standard, Imputed, and Branch-Specific"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    theme: flatly
+    fig_caption: true
+params:
+  merged_table:   "merged_mkt_results.tsv"
+  orthogroup_table: "orthogroup_table.tsv"
+  output_table:   "branch_specific_MKT_results.tsv"
+  candidates_table_all: "candidates_all.tsv"
+  candidates_table_bs:  "candidates_branch_specific.tsv"
+  candidates_shared:    "candidates_shared.tsv"
+  species: "focal species"
+  focal_species_in_ortho_table: ""
+  # Named list mapping orthogroup-table species name → MKT result TSV path for
+  # other focal species (output of this same Rmd run for each other species):
+  #   e.g.  list(Aegilops_mutica = "mutica/branch_specific_MKT_results.tsv")
+  other_results: !r list()
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.align = "center")
+```
+
+```{r libraries}
+library(tidyverse)
+library(kableExtra)
+library(patchwork)
+library(UpSetR)
+library(DT)
+```
+
+This notebook runs **four McDonald-Kreitman tests** on the merged table produced
+by `merge_mkt_results.py`, adds ortholog annotations from `orthogroup_table.py`,
+identifies positive selection candidates, and compares results across focal species.
+
+| Test | Pn used | Dn / Ds source |
+|------|---------|----------------|
+| Standard MKT | raw Pn | fixN / fixS from dNdSpiNpiS |
+| Standard impMKT | PnNeutral (SDM-corrected) | fixN / fixS from dNdSpiNpiS |
+| Branch-specific MKT | raw Pn | round(dN × N\_codeml) / round(dS × S\_codeml) |
+| Branch-specific impMKT | PnNeutral (SDM-corrected) | round(dN × N\_codeml) / round(dS × S\_codeml) |
+
+Branch-specific Dn and Ds convert codeml rate estimates back to divergence counts:
+$$D_N^{branch} = \text{round}(dN \times N_{codeml}), \quad D_S^{branch} = \text{round}(dS \times S_{codeml})$$
+
+---
+
+## 1  Load data
+
+### 1.1  Merged results table
+
+```{r load_merged}
+df <- read_tsv(
+  params$merged_table,
+  col_types = cols(.default   = col_double(),
+                   gene_id    = col_character(),
+                   ortholog   = col_character(),
+                   species    = col_character(),
+                   downsampled = col_character(),
+                   nt_engine  = col_character()),
+  na = c("NA", "NaN", "")
+)
+
+cat(sprintf("Loaded %d genes  |  %d columns\n", nrow(df), ncol(df)))
+cat(sprintf("Species              : %s\n", params$species))
+cat(sprintf("Genes with dn_counts : %d\n", sum(!is.na(df$dn_counts))))
+cat(sprintf("Genes with dN codeml : %d\n", sum(!is.na(df$dN))))
+```
+
+### 1.2  Orthogroup table → ortholog columns
+
+Ortholog gene IDs for every species in the orthogroup are joined by HOG ID
+(`ortholog` column). Column names are built from the last word of each species
+name (e.g. `Aegilops_speltoides` → `speltoides_ortholog`).
+
+```{r load_ortho}
+ortho_raw <- read_tsv(params$orthogroup_table, col_types = cols(.default = col_character()))
+# Rename first column to "ortholog" regardless of its actual name
+colnames(ortho_raw)[1] <- "ortholog"
+
+ortho_species <- setdiff(colnames(ortho_raw), "ortholog")
+
+# Short name: last word after the final underscore
+short_name <- function(sp) sub(".*_", "", sp)
+
+# Auto-detect which orthogroup-table column corresponds to the focal species.
+# Strategy: remove underscores and lowercase, match against the 'species' column
+# in the merged table (which uses the same cleaned convention).
+if (nchar(params$focal_species_in_ortho_table) > 0) {
+  focal_sp_col <- params$focal_species_in_ortho_table
+} else {
+  sp_from_data  <- tolower(unique(na.omit(df$species))[1])
+  ortho_clean   <- tolower(gsub("_", "", ortho_species))
+  match_idx     <- which(ortho_clean == sp_from_data)
+  if (length(match_idx) == 1L) {
+    focal_sp_col <- ortho_species[match_idx]
+    cat("Auto-detected focal species column:", focal_sp_col, "\n")
+  } else {
+    stop("Could not auto-detect focal species in orthogroup table.\n",
+         "Set params$focal_species_in_ortho_table explicitly.\n",
+         "Available columns: ", paste(ortho_species, collapse = ", "))
+  }
+}
+
+# Build rename map:  "Aegilops_mutica" → "mutica_ortholog"
+rename_map <- setNames(
+  paste0(sapply(ortho_species, short_name), "_ortholog"),
+  ortho_species
+)
+
+ortho_renamed <- ortho_raw %>%
+  rename(all_of(rename_map))
+
+ortholog_cols <- paste0(sapply(ortho_species, short_name), "_ortholog")
+focal_ortho_col <- rename_map[focal_sp_col]   # e.g. "speltoides_ortholog"
+other_ortho_cols <- setdiff(ortholog_cols, focal_ortho_col)
+
+cat("Orthogroup table: ", nrow(ortho_renamed), "HOGs × ",
+    length(ortho_species), "species\n")
+cat("Focal species column: ", focal_ortho_col, "\n")
+cat("Other species:       ", paste(other_ortho_cols, collapse = ", "), "\n")
+
+# Join orthogroup info into main data frame
+df <- df %>% left_join(ortho_renamed, by = "ortholog")
+
+n_matched <- sum(!is.na(df[[focal_ortho_col]]))
+cat(sprintf("\nOrthogroup join: %d / %d genes matched a HOG\n", n_matched, nrow(df)))
+```
+
+---
+
+## 2  Helper functions
+
+```{r helpers}
+# Fisher's exact test on the MK 2×2 table [[Pn, Dn], [Ps, Ds]]
+mk_fisher <- function(Pn, Ps, Dn, Ds) {
+  mapply(function(pn, ps, dn, ds) {
+    if (any(is.na(c(pn, ps, dn, ds)))) return(NA_real_)
+    if (any(c(pn, ps, dn, ds) < 0))   return(NA_real_)
+    tryCatch(
+      fisher.test(matrix(c(round(pn), round(ps), round(dn), round(ds)),
+                         nrow = 2))$p.value,
+      error = function(e) NA_real_
+    )
+  }, Pn, Ps, Dn, Ds, SIMPLIFY = TRUE)
+}
+
+# DoS = Dn/(Dn+Ds) − Pn/(Pn+Ps)  (Stoletzki & Eyre-Walker 2011)
+compute_dos <- function(Pn, Ps, Dn, Ds) {
+  ifelse(!is.na(Dn) & !is.na(Ds) & (Dn + Ds) > 0, Dn / (Dn + Ds), NA_real_) -
+  ifelse(!is.na(Pn) & !is.na(Ps) & (Pn + Ps) > 0, Pn / (Pn + Ps), NA_real_)
+}
+
+# α = 1 − (Ds × Pn) / (Dn × Ps)
+compute_alpha <- function(Pn, Ps, Dn, Ds) {
+  ifelse(!is.na(Dn) & !is.na(Ps) & Dn > 0 & Ps > 0,
+         1 - (Ds * Pn) / (Dn * Ps), NA_real_)
+}
+
+# Standard MKT filter: Pn+Ps ≥ 5, all four cells ≥ 1
+mk_filter <- function(Pn, Ps, Dn, Ds) {
+  !is.na(Pn) & Pn >= 1 & !is.na(Ps) & Ps >= 1 &
+  !is.na(Dn) & Dn >= 1 & !is.na(Ds) & Ds >= 1 &
+  (Pn + Ps) >= 5
+}
+
+# Positive candidate: DoS > 0 AND raw p < 0.05
+is_positive <- function(DoS, pval) {
+  !is.na(DoS) & DoS > 0 & !is.na(pval) & pval < 0.05
+}
+```
+
+---
+
+## 3  Branch-specific divergence counts
+
+```{r branch_specific_counts}
+df <- df %>%
+  mutate(
+    Dn_branch_specific = round(dN * N_codeml),
+    Ds_branch_specific = round(dS * S_codeml),
+    DnDs_branch_specific_counts = ifelse(
+      !is.na(Ds_branch_specific) & Ds_branch_specific > 0,
+      Dn_branch_specific / Ds_branch_specific, NA_real_
+    )
+  )
+
+cat(sprintf("Dn_branch_specific  — n: %d  median: %.1f  mean: %.2f\n",
+    sum(!is.na(df$Dn_branch_specific)),
+    median(df$Dn_branch_specific, na.rm = TRUE),
+    mean(df$Dn_branch_specific,   na.rm = TRUE)))
+cat(sprintf("Ds_branch_specific  — n: %d  median: %.1f  mean: %.2f\n",
+    sum(!is.na(df$Ds_branch_specific)),
+    median(df$Ds_branch_specific, na.rm = TRUE),
+    mean(df$Ds_branch_specific,   na.rm = TRUE)))
+```
+
+---
+
+## 4  MKT tests
+
+### 4.1  Standard MKT
+
+Dn/Ds = fixN/fixS (dNdSpiNpiS). Filter: Pn + Ps ≥ 5, all cells ≥ 1.
+
+```{r standard_mkt}
+std <- df %>%
+  mutate(
+    Pn = num_pol_NS,
+    Ps = num_pol_S,
+    Dn = dn_counts,
+    Ds = ds_counts,
+    standard_MKT        = compute_alpha(Pn, Ps, Dn, Ds),
+    DoS_MKT_standard    = compute_dos(Pn, Ps, Dn, Ds),
+    standard_MKT_pvalue = mk_fisher(Pn, Ps, Dn, Ds)
+  )
+
+std_mask <- mk_filter(std$Pn, std$Ps, std$Dn, std$Ds)
+std <- std %>% mutate(standard_MKT_p_adj = NA_real_)
+if (any(std_mask))
+  std$standard_MKT_p_adj[std_mask] <-
+    p.adjust(std$standard_MKT_pvalue[std_mask], method = "BH")
+
+std_filtered <- std %>% filter(std_mask)
+cat(sprintf("Standard MKT     : %d / %d genes passed filter\n",
+            nrow(std_filtered), nrow(df)))
+```
+
+### 4.2  Standard impMKT
+
+```{r standard_impmkt}
+imp <- std %>%
+  mutate(
+    PnNeutral_safe         = pmax(0, pmin(PnNeutral_estimation, num_pol_NS)),
+    standard_impMKT        = compute_alpha(PnNeutral_safe, Ps, Dn, Ds),
+    DoS_impMKT_standard    = compute_dos(PnNeutral_safe, Ps, Dn, Ds),
+    standard_impMKT_pvalue = mk_fisher(PnNeutral_safe, Ps, Dn, Ds)
+  )
+
+imp_mask <- mk_filter(imp$PnNeutral_safe, imp$Ps, imp$Dn, imp$Ds)
+imp <- imp %>% mutate(standard_impMKT_p_adj = NA_real_)
+if (any(imp_mask))
+  imp$standard_impMKT_p_adj[imp_mask] <-
+    p.adjust(imp$standard_impMKT_pvalue[imp_mask], method = "BH")
+
+imp_filtered <- imp %>% filter(imp_mask)
+cat(sprintf("Standard impMKT  : %d / %d genes passed filter\n",
+            nrow(imp_filtered), nrow(df)))
+```
+
+### 4.3  Branch-specific MKT
+
+Dn/Ds = round(dN × N\_codeml) / round(dS × S\_codeml).
+
+```{r branch_specific_mkt}
+bs <- imp %>%
+  mutate(
+    Dn_bs = Dn_branch_specific,
+    Ds_bs = Ds_branch_specific,
+    branch_specific_MKT        = compute_alpha(Pn, Ps, Dn_bs, Ds_bs),
+    DoS_branch_specific_MKT    = compute_dos(Pn, Ps, Dn_bs, Ds_bs),
+    branch_specific_MKT_pvalue = mk_fisher(Pn, Ps, Dn_bs, Ds_bs)
+  )
+
+bs_mask <- mk_filter(bs$Pn, bs$Ps, bs$Dn_bs, bs$Ds_bs)
+bs <- bs %>% mutate(branch_specific_MKT_p_adj = NA_real_)
+if (any(bs_mask))
+  bs$branch_specific_MKT_p_adj[bs_mask] <-
+    p.adjust(bs$branch_specific_MKT_pvalue[bs_mask], method = "BH")
+
+bs_filtered <- bs %>% filter(bs_mask)
+cat(sprintf("Branch-spec MKT  : %d / %d genes passed filter\n",
+            nrow(bs_filtered), nrow(df)))
+```
+
+### 4.4  Branch-specific impMKT
+
+```{r branch_specific_impmkt}
+bs_imp <- bs %>%
+  mutate(
+    branch_specific_impMKT        = compute_alpha(PnNeutral_safe, Ps, Dn_bs, Ds_bs),
+    DoS_branch_specific_impMKT    = compute_dos(PnNeutral_safe, Ps, Dn_bs, Ds_bs),
+    branch_specific_impMKT_pvalue = mk_fisher(PnNeutral_safe, Ps, Dn_bs, Ds_bs)
+  )
+
+bs_imp_mask <- mk_filter(bs_imp$PnNeutral_safe, bs_imp$Ps, bs_imp$Dn_bs, bs_imp$Ds_bs)
+bs_imp <- bs_imp %>% mutate(branch_specific_impMKT_p_adj = NA_real_)
+if (any(bs_imp_mask))
+  bs_imp$branch_specific_impMKT_p_adj[bs_imp_mask] <-
+    p.adjust(bs_imp$branch_specific_impMKT_pvalue[bs_imp_mask], method = "BH")
+
+bs_imp_filtered <- bs_imp %>% filter(bs_imp_mask)
+cat(sprintf("Branch-spec impMKT: %d / %d genes passed filter\n",
+            nrow(bs_imp_filtered), nrow(df)))
+```
+
+### 4.5  Mark positive candidates
+
+A gene is a **positive candidate** if DoS > 0 AND raw p-value < 0.05 in at
+least one of the four tests.
+
+```{r mark_positive}
+bs_imp <- bs_imp %>%
+  mutate(
+    pos_standard_MKT           = is_positive(DoS_MKT_standard,          standard_MKT_pvalue),
+    pos_standard_impMKT        = is_positive(DoS_impMKT_standard,        standard_impMKT_pvalue),
+    pos_branch_specific_MKT    = is_positive(DoS_branch_specific_MKT,    branch_specific_MKT_pvalue),
+    pos_branch_specific_impMKT = is_positive(DoS_branch_specific_impMKT, branch_specific_impMKT_pvalue),
+    pos_any    = pos_standard_MKT | pos_standard_impMKT |
+                 pos_branch_specific_MKT | pos_branch_specific_impMKT,
+    pos_any_bs = pos_branch_specific_MKT | pos_branch_specific_impMKT,
+    # Comma-separated list of all tests where this gene is a positive candidate
+    method = pmap_chr(
+      list(pos_standard_MKT, pos_standard_impMKT,
+           pos_branch_specific_MKT, pos_branch_specific_impMKT),
+      function(a, b, c, d) {
+        paste(c(
+          "Standard MKT"[isTRUE(a)],
+          "Standard impMKT"[isTRUE(b)],
+          "Branch-specific MKT"[isTRUE(c)],
+          "Branch-specific impMKT"[isTRUE(d)]
+        ), collapse = ", ")
+      }
+    )
+  )
+
+cat(sprintf("Positive candidates (any test) : %d genes\n",
+            sum(bs_imp$pos_any, na.rm = TRUE)))
+cat(sprintf("  of which branch-specific only: %d genes\n",
+            sum(bs_imp$pos_any_bs & !bs_imp$pos_standard_MKT &
+                !bs_imp$pos_standard_impMKT, na.rm = TRUE)))
+```
+
+---
+
+## 5  Output results table
+
+All input columns plus the 19 MKT statistics columns, 3 branch-specific
+divergence count columns, and all ortholog columns.
+FDR correction: Benjamini-Hochberg (BH).
+
+```{r write_output}
+results <- bs_imp %>%
+  select(
+    gene_id, ortholog, all_of(ortholog_cols),
+    number_sites, num_codons_eff,
+    Pi_per_site, pi_S, pi_NS, thetaW_per_site, Tajimas_D,
+    num_sites_S_egglib, num_sites_NS_egglib,
+    polymorphism_count, num_pol_S, num_pol_NS, sample_size,
+    PnMinus, PnGreater, PsMinus, PsGreater,
+    ratioPs, PnNeutral_estimation,
+    PnNeutral = round(PnNeutral_safe), deleterious,
+    dn_counts, ds_counts,
+    dN, dS, N_codeml, S_codeml, omega,
+    lnL_branch_model, lnL_m0_model, omega_m0, omega_diff,
+    Dn_branch_specific, Ds_branch_specific, DnDs_branch_specific_counts,
+    standard_MKT,        standard_impMKT,
+    branch_specific_MKT, branch_specific_impMKT,
+    DoS_MKT_standard,    standard_MKT_pvalue,    standard_MKT_p_adj,
+    DoS_impMKT_standard, standard_impMKT_pvalue, standard_impMKT_p_adj,
+    DoS_branch_specific_MKT,    branch_specific_MKT_pvalue,    branch_specific_MKT_p_adj,
+    DoS_branch_specific_impMKT, branch_specific_impMKT_pvalue, branch_specific_impMKT_p_adj,
+    pos_standard_MKT, pos_standard_impMKT,
+    pos_branch_specific_MKT, pos_branch_specific_impMKT
+  )
+
+write_tsv(results, params$output_table, na = "NA")
+cat(sprintf("Written: %s  (%d genes, %d columns)\n",
+            params$output_table, nrow(results), ncol(results)))
+```
+
+---
+
+## 6  Summary statistics
+
+```{r summary_stats}
+bind_rows(
+  std_filtered %>% summarise(
+    Test             = "Standard MKT",
+    n_genes_tested   = n(),
+    n_DoS_positive   = sum(DoS_MKT_standard > 0, na.rm = TRUE),
+    n_sig_raw_p05    = sum(standard_MKT_pvalue < 0.05, na.rm = TRUE),
+    n_pos_selected   = sum(DoS_MKT_standard > 0 & standard_MKT_pvalue < 0.05, na.rm = TRUE),
+    pct_pos_selected = round(100 * n_pos_selected / n_genes_tested, 1),
+    median_DoS       = round(median(DoS_MKT_standard, na.rm = TRUE), 4),
+    median_alpha     = round(median(standard_MKT, na.rm = TRUE), 4)
+  ),
+  imp_filtered %>% summarise(
+    Test             = "Standard impMKT",
+    n_genes_tested   = n(),
+    n_DoS_positive   = sum(DoS_impMKT_standard > 0, na.rm = TRUE),
+    n_sig_raw_p05    = sum(standard_impMKT_pvalue < 0.05, na.rm = TRUE),
+    n_pos_selected   = sum(DoS_impMKT_standard > 0 & standard_impMKT_pvalue < 0.05, na.rm = TRUE),
+    pct_pos_selected = round(100 * n_pos_selected / n_genes_tested, 1),
+    median_DoS       = round(median(DoS_impMKT_standard, na.rm = TRUE), 4),
+    median_alpha     = round(median(standard_impMKT, na.rm = TRUE), 4)
+  ),
+  bs_filtered %>% summarise(
+    Test             = "Branch-specific MKT",
+    n_genes_tested   = n(),
+    n_DoS_positive   = sum(DoS_branch_specific_MKT > 0, na.rm = TRUE),
+    n_sig_raw_p05    = sum(branch_specific_MKT_pvalue < 0.05, na.rm = TRUE),
+    n_pos_selected   = sum(DoS_branch_specific_MKT > 0 & branch_specific_MKT_pvalue < 0.05, na.rm = TRUE),
+    pct_pos_selected = round(100 * n_pos_selected / n_genes_tested, 1),
+    median_DoS       = round(median(DoS_branch_specific_MKT, na.rm = TRUE), 4),
+    median_alpha     = round(median(branch_specific_MKT, na.rm = TRUE), 4)
+  ),
+  bs_imp_filtered %>% summarise(
+    Test             = "Branch-specific impMKT",
+    n_genes_tested   = n(),
+    n_DoS_positive   = sum(DoS_branch_specific_impMKT > 0, na.rm = TRUE),
+    n_sig_raw_p05    = sum(branch_specific_impMKT_pvalue < 0.05, na.rm = TRUE),
+    n_pos_selected   = sum(DoS_branch_specific_impMKT > 0 & branch_specific_impMKT_pvalue < 0.05, na.rm = TRUE),
+    pct_pos_selected = round(100 * n_pos_selected / n_genes_tested, 1),
+    median_DoS       = round(median(DoS_branch_specific_impMKT, na.rm = TRUE), 4),
+    median_alpha     = round(median(branch_specific_impMKT, na.rm = TRUE), 4)
+  )
+) %>%
+  kbl(caption = sprintf("MKT summary — %s", params$species)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+---
+
+## 7  Positive selection candidates
+
+### 7.1  All positive candidates (any test)
+
+Genes with DoS > 0 and raw p-value < 0.05 in **at least one** of the four tests.
+
+```{r candidates_all_prep}
+# Base columns for the candidate tables
+base_cols <- c("gene_id", "ortholog", "method", ortholog_cols)
+
+candidates_all <- bs_imp %>%
+  filter(pos_any) %>%
+  mutate(focal_species = params$species) %>%
+  select(focal_species, all_of(base_cols),
+         DoS_MKT_standard, standard_MKT_pvalue, standard_MKT_p_adj,
+         DoS_impMKT_standard, standard_impMKT_pvalue, standard_impMKT_p_adj,
+         DoS_branch_specific_MKT, branch_specific_MKT_pvalue, branch_specific_MKT_p_adj,
+         DoS_branch_specific_impMKT, branch_specific_impMKT_pvalue, branch_specific_impMKT_p_adj,
+         pos_standard_MKT, pos_standard_impMKT,
+         pos_branch_specific_MKT, pos_branch_specific_impMKT) %>%
+  arrange(gene_id)
+
+cat(sprintf("All positive candidates: %d genes\n", nrow(candidates_all)))
+```
+
+```{r candidates_all_cross_species, results='asis'}
+# ── Cross-species annotation (only when other_results are provided) ─────────
+# For each other focal species, load its result file, identify positive genes,
+# and add in_<species> and <species>_method columns to candidates_all.
+# The link is the HOG identifier (ortholog column, shared across species).
+
+has_other <- length(params$other_results) > 0
+
+if (has_other) {
+  for (sp_full in names(params$other_results)) {
+    sp_file  <- params$other_results[[sp_full]]
+    sp_short <- tolower(sub(".*_", "", sp_full))   # e.g. "mutica"
+    in_col   <- paste0("in_", sp_short)
+    meth_col <- paste0(sp_short, "_method")
+
+    if (!file.exists(sp_file)) {
+      warning("Other species file not found, skipping: ", sp_file)
+      next
+    }
+
+    sp_data <- read_tsv(sp_file,
+                        col_types = cols(.default  = col_double(),
+                                         gene_id   = col_character(),
+                                         ortholog  = col_character()),
+                        na = c("NA", "NaN", "")) %>%
+      filter(!is.na(ortholog)) %>%
+      mutate(
+        pos_std    = is_positive(DoS_MKT_standard,         standard_MKT_pvalue),
+        pos_imp    = is_positive(DoS_impMKT_standard,       standard_impMKT_pvalue),
+        pos_bs     = is_positive(DoS_branch_specific_MKT,   branch_specific_MKT_pvalue),
+        pos_bs_imp = is_positive(DoS_branch_specific_impMKT, branch_specific_impMKT_pvalue)
+      ) %>%
+      filter(pos_std | pos_imp | pos_bs | pos_bs_imp) %>%
+      mutate(
+        !!meth_col := pmap_chr(
+          list(pos_std, pos_imp, pos_bs, pos_bs_imp),
+          function(a, b, c, d) {
+            paste(c(
+              "Standard MKT"[isTRUE(a)],
+              "Standard impMKT"[isTRUE(b)],
+              "Branch-specific MKT"[isTRUE(c)],
+              "Branch-specific impMKT"[isTRUE(d)]
+            ), collapse = ", ")
+          }
+        )
+      ) %>%
+      select(ortholog, !!meth_col)
+
+    candidates_all <- candidates_all %>%
+      left_join(sp_data, by = "ortholog") %>%
+      mutate(!!in_col := !is.na(.data[[meth_col]]))
+
+    cat(sprintf("  Cross-species: %d candidates have a positive ortholog in %s\n",
+                sum(candidates_all[[in_col]], na.rm = TRUE), sp_full))
+  }
+}
+```
+
+```{r candidates_all_write}
+write_tsv(candidates_all, params$candidates_table_all, na = "NA")
+cat(sprintf("Written: %s\n", params$candidates_table_all))
+```
+
+```{r candidates_all_display}
+# Interactive table: display key columns
+display_cols <- c("gene_id", "ortholog", "method", ortholog_cols)
+if (has_other) {
+  extra <- names(params$other_results) %>%
+    lapply(function(sp) {
+      sh <- tolower(sub(".*_", "", sp))
+      c(paste0("in_", sh), paste0(sh, "_method"))
+    }) %>% unlist()
+  display_cols <- c(display_cols, extra)
+}
+
+candidates_all %>%
+  select(any_of(display_cols)) %>%
+  datatable(
+    caption = sprintf("All positive candidates — %s (%d genes)",
+                      params$species, nrow(candidates_all)),
+    filter  = "top",
+    options = list(pageLength = 15, scrollX = TRUE)
+  )
+```
+
+### 7.2  Branch-specific candidates
+
+Genes detected by **at least one branch-specific test** (Branch-specific MKT
+or Branch-specific impMKT), regardless of standard test results.
+
+```{r candidates_bs}
+candidates_bs <- bs_imp %>%
+  filter(pos_any_bs) %>%
+  mutate(focal_species = params$species) %>%
+  select(focal_species, all_of(base_cols),
+         DoS_branch_specific_MKT, branch_specific_MKT_pvalue, branch_specific_MKT_p_adj,
+         DoS_branch_specific_impMKT, branch_specific_impMKT_pvalue, branch_specific_impMKT_p_adj,
+         pos_branch_specific_MKT, pos_branch_specific_impMKT) %>%
+  arrange(gene_id)
+
+cat(sprintf("Branch-specific positive candidates: %d genes\n", nrow(candidates_bs)))
+cat(sprintf("  Also positive in ≥1 standard test: %d\n",
+    sum(candidates_bs$gene_id %in%
+        filter(bs_imp, pos_standard_MKT | pos_standard_impMKT)$gene_id)))
+cat(sprintf("  Unique to branch-specific tests  : %d\n",
+    sum(!candidates_bs$gene_id %in%
+        filter(bs_imp, pos_standard_MKT | pos_standard_impMKT)$gene_id)))
+
+# Add cross-species columns if already computed in candidates_all
+if (has_other) {
+  cross_cols <- names(params$other_results) %>%
+    lapply(function(sp) {
+      sh <- tolower(sub(".*_", "", sp))
+      c(paste0("in_", sh), paste0(sh, "_method"))
+    }) %>% unlist()
+  cross_avail <- intersect(cross_cols, colnames(candidates_all))
+  if (length(cross_avail) > 0) {
+    candidates_bs <- candidates_bs %>%
+      left_join(
+        candidates_all %>% select(gene_id, all_of(cross_avail)),
+        by = "gene_id"
+      )
+  }
+}
+
+write_tsv(candidates_bs, params$candidates_table_bs, na = "NA")
+cat(sprintf("Written: %s\n", params$candidates_table_bs))
+```
+
+```{r candidates_bs_display}
+candidates_bs %>%
+  select(any_of(display_cols)) %>%
+  datatable(
+    caption = sprintf("Branch-specific candidates — %s (%d genes)",
+                      params$species, nrow(candidates_bs)),
+    filter  = "top",
+    options = list(pageLength = 15, scrollX = TRUE)
+  )
+```
+
+### 7.3  Candidates shared between focal species
+
+Orthogroups where the focal species and at least one other focal species both
+show evidence of positive selection (detected in any test).
+
+```{r candidates_shared, results='asis'}
+if (!has_other) {
+  cat("> *No other species results provided — set `params$other_results` to",
+      "enable cross-species shared-candidate analysis.*\n")
+} else {
+  # Find candidates shared between focal species and ≥1 other species
+  other_species_short <- names(params$other_results) %>%
+    sapply(function(sp) tolower(sub(".*_", "", sp)))
+
+  in_cols <- paste0("in_", other_species_short)
+  in_cols_present <- intersect(in_cols, colnames(candidates_all))
+
+  if (length(in_cols_present) == 0) {
+    cat("> *Cross-species columns not found — check other_results loading.*\n")
+  } else {
+    shared_mask <- rowSums(
+      candidates_all[, in_cols_present, drop = FALSE], na.rm = TRUE
+    ) >= 1
+
+    candidates_shared <- candidates_all[shared_mask, ]
+
+    cat(sprintf("Shared candidates (positive in focal + ≥1 other species): %d genes\n",
+                nrow(candidates_shared)))
+
+    # Build a tidy summary: one row per shared HOG, all species' gene IDs and methods
+    shared_summary <- candidates_shared %>%
+      select(gene_id, ortholog, method, all_of(ortholog_cols),
+             all_of(intersect(
+               c(in_cols_present, paste0(other_species_short, "_method")),
+               colnames(candidates_shared)
+             )))
+
+    write_tsv(shared_summary, params$candidates_shared, na = "NA")
+    cat(sprintf("Written: %s\n", params$candidates_shared))
+
+    print(
+      shared_summary %>%
+        datatable(
+          caption = sprintf("Shared candidates — %s (%d HOGs)",
+                            params$species, nrow(shared_summary)),
+          filter  = "top",
+          options = list(pageLength = 15, scrollX = TRUE)
+        )
+    )
+  }
+}
+```
+
+---
+
+## 8  Visualizations
+
+```{r colours, include=FALSE}
+CLR_STD    <- "#4C72B0"   # standard MKT (blue)
+CLR_IMP    <- "#DD8452"   # standard impMKT (orange)
+CLR_BS     <- "#55A868"   # branch-specific MKT (green)
+CLR_BS_IMP <- "#8172B2"   # branch-specific impMKT (purple)
+CLR_POS    <- "#C44E52"   # positive selection (red)
+CLR_NEG    <- "#55A868"   # purifying selection (green)
+CLR_NTRL   <- "#8C8C8C"   # not significant (grey)
+
+TEST_COLOURS <- c(
+  "Standard MKT"           = CLR_STD,
+  "Standard impMKT"        = CLR_IMP,
+  "Branch-specific MKT"    = CLR_BS,
+  "Branch-specific impMKT" = CLR_BS_IMP
+)
+
+theme_pub <- theme_classic(base_size = 11) +
+  theme(
+    plot.title    = element_text(size = 11, face = "bold"),
+    plot.subtitle = element_text(size = 9,  colour = "grey40"),
+    strip.text    = element_text(size = 9,  face = "bold"),
+    axis.title    = element_text(size = 10)
+  )
+theme_set(theme_pub)
+```
+
+### 8.1  UpSet plot — candidate genes by method
+
+Intersections among positive candidates across the four tests (DoS > 0 and
+raw p < 0.05). Up to 14 intersections shown, ordered by frequency.
+
+```{r upset_plot, fig.width=9, fig.height=5, fig.cap="UpSet plot showing the number of positive selection candidates identified by each combination of tests. Bar heights show set sizes; connected dots show which tests are included in each intersection."}
+upset_df <- bs_imp %>%
+  filter(pos_any) %>%
+  transmute(
+    `Standard MKT`           = as.integer(pos_standard_MKT),
+    `Standard impMKT`        = as.integer(pos_standard_impMKT),
+    `Branch-specific MKT`    = as.integer(pos_branch_specific_MKT),
+    `Branch-specific impMKT` = as.integer(pos_branch_specific_impMKT)
+  ) %>%
+  as.data.frame()
+
+upset(
+  upset_df,
+  sets = c("Standard MKT", "Standard impMKT",
+           "Branch-specific MKT", "Branch-specific impMKT"),
+  nintersects   = 14,
+  order.by      = "freq",
+  sets.bar.color = c(CLR_STD, CLR_IMP, CLR_BS, CLR_BS_IMP),
+  main.bar.color = "grey40",
+  text.scale     = 1.2,
+  point.size     = 3,
+  line.size      = 1
+)
+```
+
+### 8.2  MKT filter summary
+
+```{r plot_filter, fig.width=9, fig.height=4, fig.cap="Number of genes at each analysis stage."}
+filter_df <- tibble(
+  Stage = factor(
+    c("All genes", "Standard MKT", "Standard impMKT",
+      "Branch-specific MKT", "Branch-specific impMKT"),
+    levels = c("All genes", "Standard MKT", "Standard impMKT",
+               "Branch-specific MKT", "Branch-specific impMKT")
+  ),
+  n = c(nrow(df), nrow(std_filtered), nrow(imp_filtered),
+        nrow(bs_filtered), nrow(bs_imp_filtered))
+)
+
+ggplot(filter_df, aes(x = Stage, y = n, fill = Stage)) +
+  geom_col(width = 0.65, colour = "white") +
+  geom_text(aes(label = n), vjust = -0.4, size = 3.5) +
+  scale_fill_manual(values = c(
+    "All genes"               = "grey70",
+    "Standard MKT"            = CLR_STD,
+    "Standard impMKT"         = CLR_IMP,
+    "Branch-specific MKT"     = CLR_BS,
+    "Branch-specific impMKT"  = CLR_BS_IMP
+  )) +
+  labs(title = "Genes passing MKT filters", x = NULL, y = "Number of genes") +
+  expand_limits(y = max(filter_df$n) * 1.12) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+### 8.3  Alignment and polymorphism statistics
+
+```{r plot_alignment, fig.width=10, fig.height=4, fig.cap="Effective nucleotide sites (left) and sample size (right). Dashed line = median."}
+p_len <- ggplot(df, aes(x = number_sites)) +
+  geom_histogram(bins = 40, fill = CLR_STD, colour = "white") +
+  geom_vline(xintercept = median(df$number_sites, na.rm = TRUE),
+             linetype = "dashed", colour = "grey30") +
+  labs(title = "Alignment length",
+       subtitle = sprintf("median = %d nt", round(median(df$number_sites, na.rm = TRUE))),
+       x = "Effective nucleotide sites", y = "Genes")
+
+p_ss <- ggplot(df, aes(x = sample_size)) +
+  geom_histogram(bins = 30, fill = CLR_STD, colour = "white") +
+  geom_vline(xintercept = median(df$sample_size, na.rm = TRUE),
+             linetype = "dashed", colour = "grey30") +
+  labs(title = "Sample size",
+       subtitle = sprintf("median = %d alleles", round(median(df$sample_size, na.rm = TRUE))),
+       x = "Number of alleles", y = "Genes")
+
+p_len + p_ss
+```
+
+```{r plot_pi, fig.width=12, fig.height=9, fig.cap="Population-genetics statistics. Top: nucleotide diversity and Watterson theta. Bottom: Tajima's D and synonymous vs non-synonymous diversity."}
+p_pi <- ggplot(df, aes(x = Pi_per_site)) +
+  geom_histogram(bins = 40, fill = CLR_STD, colour = "white") +
+  geom_vline(xintercept = median(df$Pi_per_site, na.rm = TRUE),
+             linetype = "dashed", colour = "grey30") +
+  labs(title = expression(paste("Nucleotide diversity ", pi, " per site")),
+       x = "Pi_per_site", y = "Genes")
+
+p_tw <- ggplot(df, aes(x = thetaW_per_site)) +
+  geom_histogram(bins = 40, fill = CLR_STD, colour = "white") +
+  labs(title = expression(paste("Watterson's ", theta, " per site")),
+       x = "thetaW_per_site", y = "Genes")
+
+p_td <- ggplot(df, aes(x = Tajimas_D)) +
+  geom_histogram(bins = 40, fill = CLR_STD, colour = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey30") +
+  labs(title = "Tajima's D", x = "Tajimas_D", y = "Genes")
+
+p_piSNS <- df %>%
+  filter(!is.na(pi_S) & !is.na(pi_NS)) %>%
+  ggplot(aes(x = pi_S, y = pi_NS)) +
+  geom_point(alpha = 0.3, size = 1, colour = CLR_STD) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey30") +
+  labs(title = expression(paste(pi[NS], " vs ", pi[S])),
+       subtitle = "Above diagonal: excess NS diversity",
+       x = expression(pi[S]), y = expression(pi[NS]))
+
+(p_pi + p_tw) / (p_td + p_piSNS)
+```
+
+### 8.4  Divergence count distributions
+
+```{r plot_div_counts, fig.width=12, fig.height=8, fig.cap="Standard Dn/Ds (fixN/fixS from dNdSpiNpiS; top row) and branch-specific Dn/Ds (codeml rates × sites; bottom row)."}
+p_Ds_std <- ggplot(df %>% filter(!is.na(ds_counts)), aes(x = ds_counts)) +
+  geom_histogram(bins = 30, fill = CLR_STD, colour = "white") +
+  labs(title = "Synonymous divergence — standard (Ds)", x = "ds_counts", y = "Genes")
+
+p_Dn_std <- ggplot(df %>% filter(!is.na(dn_counts)), aes(x = dn_counts)) +
+  geom_histogram(bins = 30, fill = CLR_STD, colour = "white") +
+  labs(title = "Non-synonymous divergence — standard (Dn)", x = "dn_counts", y = "Genes")
+
+p_Ds_bs <- ggplot(df %>% filter(!is.na(Ds_branch_specific)), aes(x = Ds_branch_specific)) +
+  geom_histogram(bins = 30, fill = CLR_BS, colour = "white") +
+  labs(title = "Synonymous divergence — branch-specific",
+       subtitle = "round(dS × S_codeml)", x = "Ds_branch_specific", y = "Genes")
+
+p_Dn_bs <- ggplot(df %>% filter(!is.na(Dn_branch_specific)), aes(x = Dn_branch_specific)) +
+  geom_histogram(bins = 30, fill = CLR_BS, colour = "white") +
+  labs(title = "Non-synonymous divergence — branch-specific",
+       subtitle = "round(dN × N_codeml)", x = "Dn_branch_specific", y = "Genes")
+
+(p_Ds_std + p_Dn_std) / (p_Ds_bs + p_Dn_bs)
+```
+
+```{r plot_div_scatter, fig.width=10, fig.height=4, fig.cap="Correlation between standard and branch-specific divergence counts. Dashed line = 1:1."}
+p_Ds_corr <- df %>%
+  filter(!is.na(ds_counts) & !is.na(Ds_branch_specific)) %>%
+  ggplot(aes(x = ds_counts, y = Ds_branch_specific)) +
+  geom_point(alpha = 0.25, size = 1, colour = CLR_STD) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey30") +
+  labs(title = "Ds: standard vs branch-specific",
+       x = "ds_counts (fixS)", y = "Ds_branch_specific (round(dS × S))")
+
+p_Dn_corr <- df %>%
+  filter(!is.na(dn_counts) & !is.na(Dn_branch_specific)) %>%
+  ggplot(aes(x = dn_counts, y = Dn_branch_specific)) +
+  geom_point(alpha = 0.25, size = 1, colour = CLR_BS) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey30") +
+  labs(title = "Dn: standard vs branch-specific",
+       x = "dn_counts (fixN)", y = "Dn_branch_specific (round(dN × N))")
+
+p_Ds_corr + p_Dn_corr
+```
+
+### 8.5  SDM estimation quality
+
+```{r plot_sdm, fig.width=12, fig.height=9, fig.cap="SDM diagnostics. Top: neutral ratio and estimated SDM count. Bottom: PnNeutral vs Pn, and fraction of Pn attributed to SDMs."}
+p_ratio <- df %>%
+  filter(!is.na(ratioPs) & is.finite(ratioPs)) %>%
+  ggplot(aes(x = ratioPs)) +
+  geom_histogram(bins = 40, fill = CLR_STD, colour = "white") +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey30") +
+  labs(title = "Neutral ratio (ratioPs)",
+       subtitle = expression(paste("P"[N]^{"(>T)"}, " / P"[S]^{"(>T)"})),
+       x = "ratioPs", y = "Genes")
+
+p_del <- df %>%
+  filter(!is.na(deleterious)) %>%
+  ggplot(aes(x = deleterious)) +
+  geom_histogram(bins = 40, fill = CLR_STD, colour = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey30") +
+  labs(title = "Estimated SDMs", x = "deleterious", y = "Genes")
+
+p_pnneut <- bs_imp %>%
+  filter(!is.na(num_pol_NS) & !is.na(PnNeutral_safe)) %>%
+  ggplot(aes(x = num_pol_NS, y = PnNeutral_safe)) +
+  geom_point(alpha = 0.25, size = 1, colour = CLR_STD) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey30") +
+  labs(title = "PnNeutral vs Pn", subtitle = "Below diagonal = SDMs removed",
+       x = "Pn (num_pol_NS)", y = "PnNeutral")
+
+p_frac <- bs_imp %>%
+  filter(!is.na(num_pol_NS) & num_pol_NS > 0 & !is.na(deleterious)) %>%
+  mutate(frac_del = pmax(0, deleterious) / num_pol_NS) %>%
+  ggplot(aes(x = frac_del)) +
+  geom_histogram(bins = 40, fill = CLR_STD, colour = "white") +
+  labs(title = "Fraction of Pn attributed to SDMs", x = "Fraction SDM", y = "Genes")
+
+(p_ratio + p_del) / (p_pnneut + p_frac)
+```
+
+### 8.6  Direction of Selection (DoS) distributions
+
+```{r plot_dos, fig.width=12, fig.height=8, fig.cap="DoS = Dn/(Dn+Ds) − Pn/(Pn+Ps) for genes passing each filter. DoS > 0: positive selection; DoS < 0: purifying selection."}
+bind_rows(
+  std_filtered    %>% transmute(DoS = DoS_MKT_standard,           Test = "Standard MKT"),
+  imp_filtered    %>% transmute(DoS = DoS_impMKT_standard,         Test = "Standard impMKT"),
+  bs_filtered     %>% transmute(DoS = DoS_branch_specific_MKT,     Test = "Branch-specific MKT"),
+  bs_imp_filtered %>% transmute(DoS = DoS_branch_specific_impMKT,  Test = "Branch-specific impMKT")
+) %>%
+  mutate(Test = factor(Test, levels = names(TEST_COLOURS))) %>%
+  ggplot(aes(x = DoS, fill = Test)) +
+  geom_histogram(binwidth = 0.05, colour = "white", alpha = 0.9) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey30") +
+  facet_wrap(~Test, ncol = 2) +
+  scale_fill_manual(values = TEST_COLOURS) +
+  labs(title = "Direction of Selection (DoS)",
+       subtitle = "DoS = Dn/(Dn+Ds) − Pn/(Pn+Ps)",
+       x = "DoS", y = "Genes") +
+  theme(legend.position = "none")
+```
+
+### 8.7  α (proportion of adaptive substitutions)
+
+```{r plot_alpha, fig.width=12, fig.height=8, fig.cap="α = 1 − (Ds×Pn)/(Dn×Ps) for genes passing each filter."}
+bind_rows(
+  std_filtered    %>% transmute(alpha = standard_MKT,           Test = "Standard MKT"),
+  imp_filtered    %>% transmute(alpha = standard_impMKT,         Test = "Standard impMKT"),
+  bs_filtered     %>% transmute(alpha = branch_specific_MKT,     Test = "Branch-specific MKT"),
+  bs_imp_filtered %>% transmute(alpha = branch_specific_impMKT,  Test = "Branch-specific impMKT")
+) %>%
+  mutate(Test = factor(Test, levels = names(TEST_COLOURS))) %>%
+  filter(is.finite(alpha)) %>%
+  ggplot(aes(x = alpha, fill = Test)) +
+  geom_histogram(bins = 40, colour = "white", alpha = 0.9) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey30") +
+  facet_wrap(~Test, ncol = 2) +
+  scale_fill_manual(values = TEST_COLOURS) +
+  labs(title = expression(paste(alpha, " — proportion of adaptive substitutions")),
+       x = expression(alpha), y = "Genes") +
+  theme(legend.position = "none")
+```
+
+### 8.8  p-value distributions
+
+```{r plot_pval, fig.width=12, fig.height=8, fig.cap="Fisher's exact test p-value distributions. Enrichment near 0 indicates an excess of positive selection signals."}
+bind_rows(
+  std_filtered    %>% transmute(pval = standard_MKT_pvalue,           Test = "Standard MKT"),
+  imp_filtered    %>% transmute(pval = standard_impMKT_pvalue,         Test = "Standard impMKT"),
+  bs_filtered     %>% transmute(pval = branch_specific_MKT_pvalue,     Test = "Branch-specific MKT"),
+  bs_imp_filtered %>% transmute(pval = branch_specific_impMKT_pvalue,  Test = "Branch-specific impMKT")
+) %>%
+  mutate(Test = factor(Test, levels = names(TEST_COLOURS))) %>%
+  filter(!is.na(pval)) %>%
+  ggplot(aes(x = pval, fill = Test)) +
+  geom_histogram(bins = 20, colour = "white", alpha = 0.9) +
+  geom_vline(xintercept = 0.05, linetype = "dashed", colour = "grey30") +
+  facet_wrap(~Test, ncol = 2) +
+  scale_fill_manual(values = TEST_COLOURS) +
+  labs(title = "Fisher's exact test p-value distributions", x = "p-value", y = "Genes") +
+  theme(legend.position = "none")
+```
+
+### 8.9  Volcano plots
+
+```{r plot_volcano, fig.width=12, fig.height=9, fig.cap="Volcano plots. Red: DoS > 0 and p < 0.05 (positive). Green: DoS < 0 and p < 0.05 (purifying). Grey: not significant."}
+bind_rows(
+  std_filtered    %>% transmute(DoS = DoS_MKT_standard,           pval = standard_MKT_pvalue,        Test = "Standard MKT"),
+  imp_filtered    %>% transmute(DoS = DoS_impMKT_standard,         pval = standard_impMKT_pvalue,      Test = "Standard impMKT"),
+  bs_filtered     %>% transmute(DoS = DoS_branch_specific_MKT,     pval = branch_specific_MKT_pvalue,  Test = "Branch-specific MKT"),
+  bs_imp_filtered %>% transmute(DoS = DoS_branch_specific_impMKT,  pval = branch_specific_impMKT_pvalue, Test = "Branch-specific impMKT")
+) %>%
+  filter(!is.na(DoS) & !is.na(pval)) %>%
+  mutate(
+    log10p   = -log10(pval),
+    Test     = factor(Test, levels = names(TEST_COLOURS)),
+    category = case_when(
+      DoS > 0 & pval < 0.05 ~ "Positive selection",
+      DoS < 0 & pval < 0.05 ~ "Purifying selection",
+      TRUE                  ~ "Not significant"
+    )
+  ) %>%
+  ggplot(aes(x = DoS, y = log10p, colour = category)) +
+  geom_point(alpha = 0.45, size = 0.9) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey40") +
+  geom_vline(xintercept = 0,            linetype = "dashed", colour = "grey40") +
+  facet_wrap(~Test, ncol = 2) +
+  scale_colour_manual(values = c(
+    "Positive selection"  = CLR_POS,
+    "Purifying selection" = CLR_NEG,
+    "Not significant"     = CLR_NTRL
+  )) +
+  labs(title = "Volcano plot — direction of selection",
+       x = "DoS", y = expression(-log[10](p-value)), colour = NULL) +
+  theme(legend.position = "bottom")
+```
+
+### 8.10  Classic McDonald-Kreitman plots
+
+```{r plot_mk, fig.width=12, fig.height=9, fig.cap="McDonald-Kreitman plots. Points above 1:1 diagonal: higher Dn/Ds than Pn/Ps. Red = DoS > 0 and p < 0.05."}
+bind_rows(
+  std_filtered %>% filter(Ps > 0 & Ds > 0) %>%
+    transmute(pnps = Pn/Ps, dnds = Dn/Ds,
+              sel = DoS_MKT_standard > 0 & standard_MKT_pvalue < 0.05,
+              Test = "Standard MKT"),
+  imp_filtered %>% filter(Ps > 0 & Ds > 0) %>%
+    transmute(pnps = PnNeutral_safe/Ps, dnds = Dn/Ds,
+              sel = DoS_impMKT_standard > 0 & standard_impMKT_pvalue < 0.05,
+              Test = "Standard impMKT"),
+  bs_filtered %>% filter(Ps > 0 & Ds_bs > 0) %>%
+    transmute(pnps = Pn/Ps, dnds = Dn_bs/Ds_bs,
+              sel = DoS_branch_specific_MKT > 0 & branch_specific_MKT_pvalue < 0.05,
+              Test = "Branch-specific MKT"),
+  bs_imp_filtered %>% filter(Ps > 0 & Ds_bs > 0) %>%
+    transmute(pnps = PnNeutral_safe/Ps, dnds = Dn_bs/Ds_bs,
+              sel = DoS_branch_specific_impMKT > 0 & branch_specific_impMKT_pvalue < 0.05,
+              Test = "Branch-specific impMKT")
+) %>%
+  filter(is.finite(pnps) & is.finite(dnds)) %>%
+  mutate(Test = factor(Test, levels = names(TEST_COLOURS))) %>%
+  ggplot(aes(x = pnps, y = dnds, colour = sel)) +
+  geom_point(alpha = 0.5, size = 0.9) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40") +
+  scale_colour_manual(
+    values = c("TRUE" = CLR_POS, "FALSE" = CLR_NTRL),
+    labels = c("TRUE" = "DoS > 0 & p < 0.05", "FALSE" = "Non-significant"),
+    name   = NULL
+  ) +
+  scale_x_log10() + scale_y_log10() +
+  facet_wrap(~Test, ncol = 2) +
+  labs(title = "McDonald-Kreitman plot",
+       x = "Pn / Ps (log scale)", y = "Dn / Ds (log scale)") +
+  theme(legend.position = "bottom")
+```
+
+### 8.11  DoS comparison: standard vs branch-specific
+
+```{r plot_dos_compare, fig.width=10, fig.height=8, fig.cap="Cross-test DoS comparison. Red: positive in both, blue: positive only in standard, green: positive only in branch-specific, grey: neither."}
+make_compare <- function(data, dos_x, dos_y, label_x, label_y, title) {
+  data %>%
+    select(gene_id, x = {{ dos_x }}, y = {{ dos_y }}) %>%
+    filter(!is.na(x) & !is.na(y)) %>%
+    mutate(category = case_when(
+      x > 0 & y > 0 ~ "Both positive",
+      x > 0 & y < 0 ~ "Standard only",
+      x < 0 & y > 0 ~ "Branch-specific only",
+      TRUE           ~ "Neither"
+    )) %>%
+    ggplot(aes(x = x, y = y, colour = category)) +
+    geom_point(alpha = 0.4, size = 0.9) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+    scale_colour_manual(values = c(
+      "Both positive"        = CLR_POS,
+      "Standard only"        = CLR_STD,
+      "Branch-specific only" = CLR_BS,
+      "Neither"              = CLR_NTRL
+    )) +
+    labs(title = title, x = label_x, y = label_y, colour = NULL) +
+    theme(legend.position = "bottom")
+}
+
+p_cmp1 <- make_compare(bs_filtered, DoS_MKT_standard, DoS_branch_specific_MKT,
+  "DoS — Standard MKT", "DoS — Branch-specific MKT",
+  "MKT: standard vs branch-specific DoS")
+
+p_cmp2 <- make_compare(bs_imp_filtered, DoS_impMKT_standard, DoS_branch_specific_impMKT,
+  "DoS — Standard impMKT", "DoS — Branch-specific impMKT",
+  "impMKT: standard vs branch-specific DoS")
+
+p_cmp1 / p_cmp2
+```
+
+### 8.12  omega (codeml) vs DoS from branch-specific tests
+
+```{r plot_omega_dos, fig.width=10, fig.height=4, fig.cap="Branch-specific omega (codeml, focal species) versus DoS from branch-specific MKT (left) and impMKT (right)."}
+p_om1 <- bs_filtered %>%
+  filter(!is.na(omega) & !is.na(DoS_branch_specific_MKT)) %>%
+  ggplot(aes(x = omega, y = DoS_branch_specific_MKT)) +
+  geom_point(alpha = 0.3, size = 0.9, colour = CLR_BS) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey40") +
+  labs(title = "omega vs DoS (Branch-specific MKT)",
+       x = "omega (codeml, focal species)", y = "DoS")
+
+p_om2 <- bs_imp_filtered %>%
+  filter(!is.na(omega) & !is.na(DoS_branch_specific_impMKT)) %>%
+  ggplot(aes(x = omega, y = DoS_branch_specific_impMKT)) +
+  geom_point(alpha = 0.3, size = 0.9, colour = CLR_BS_IMP) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey40") +
+  labs(title = "omega vs DoS (Branch-specific impMKT)",
+       x = "omega (codeml, focal species)", y = "DoS")
+
+p_om1 + p_om2
+```
+
+---
+
+## Session info
+
+```{r session_info}
+sessionInfo()
+```

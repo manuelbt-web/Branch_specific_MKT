@@ -1,0 +1,44 @@
+# ── Generated outputs ──────────────────────────────────────────────────────────
+results/
+*.html
+
+# ── R session artefacts ────────────────────────────────────────────────────────
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj.user/
+
+# ── Python cache ───────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ── Large sequencing data (deposited at NCBI/ENA) ─────────────────────────────
+*.bam
+*.bai
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.fa.gz
+*.fasta.gz
+*.vcf
+*.vcf.gz
+*.bcf
+
+# ── RNA-seq count matrices (large; obtain from GEO/ArrayExpress accessions) ───
+Expression_analysis/*_count.tsv
+
+# ── Large intermediate files ───────────────────────────────────────────────────
+*.zip
+*.tar.gz
+*.tar.bz2
+
+# ── Internal planning files ────────────────────────────────────────────────────
+prompt.md
+
+# ── OS artefacts ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini

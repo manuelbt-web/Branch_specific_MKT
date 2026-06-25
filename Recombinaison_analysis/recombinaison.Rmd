@@ -1,0 +1,640 @@
+---
+title: "Recombination Rate and Positive Selection"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    theme: flatly
+    fig_caption: true
+    self_contained: true
+params:
+  # Named list: species_label → config list.
+  # Each entry must have:
+  #   output_dir      : output_dir used in render_analysis.R (for MKT results)
+  #   gene_coords_bed : 4-column BED with genomic coordinates of all genes
+  #                     Columns (no header): chr  start  end  gene_id
+  #   rec_map_bed     : 4-column BED with recombination rate intervals
+  #                     Columns (no header): chr  start  end  rec_rate
+  species_configs: !r list()
+  # Candidate set used as the binary response variable ("selected"):
+  #   "bs"      = branch-specific MKT or branch-specific impMKT (recommended)
+  #   "any"     = positive in any of the 4 MKT tests
+  candidate_type: "bs"
+  # MKT filter applied to define the statistical universe (analyzable genes):
+  # Pn + Ps >= min_poly AND all four cells (Pn, Ps, Dn, Ds) >= min_count
+  min_poly:  5
+  min_count: 1
+  # z-score threshold for sensitivity analysis (exclude |distance_z| > threshold)
+  distance_z_threshold: 3
+  # Scaling factor applied to rec_rate before modelling (default 1e6 = per Mb)
+  rec_scale: 1000000
+  # Output directory for TSV result tables
+  output_dir: "results/recombination"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.align = "center", fig.width = 10, fig.height = 6)
+
+# Compute a human-readable rec_rate axis label once, used in all plots.
+# With rec_scale = 1e6 (default) and Glemin et al. data in cM/bp,
+# rec_rate_scaled is in cM/Mb.
+rec_unit_label <- if (params$rec_scale == 1e6) "cM/Mb" else
+                  sprintf("rec_rate × %g", params$rec_scale)
+```
+
+```{r libraries}
+library(tidyverse)
+library(GenomicRanges)
+library(IRanges)
+library(S4Vectors)
+library(kableExtra)
+library(patchwork)
+```
+
+This analysis tests whether genes under branch-specific positive selection are
+enriched in genomic regions with high recombination rates. The question is
+motivated by the expected positive correlation between recombination and
+adaptive evolution (Hill-Robertson interference, reduced background selection).
+
+**Statistical model:** binomial logistic GLM with binary selection status as the
+response. Assignment uncertainty (distance from gene to the nearest
+recombination interval) enters the model as a standardised covariate
+(`distance_z`) rather than being handled by separate sub-analyses.
+
+$$\text{logit}(P[\text{selected}]) = \beta_0 + \beta_1 \cdot \text{rec\_rate\_scaled} + \beta_2 \cdot \text{distance\_z}$$
+
+---
+
+## 1  Parameter validation and input loading
+
+```{r validate_params}
+if (length(params$species_configs) == 0)
+  stop("params$species_configs is empty. Edit render_recombinaison.R and provide ",
+       "at least one species.")
+
+sp_labels  <- names(params$species_configs)
+n_species  <- length(sp_labels)
+cand_type  <- params$candidate_type
+
+cat(sprintf("Species         : %s\n", paste(sp_labels, collapse = ", ")))
+cat(sprintf("Candidate type  : %s\n", cand_type))
+cat(sprintf("MKT filter      : Pn+Ps >= %d, all cells >= %d\n",
+            params$min_poly, params$min_count))
+cat(sprintf("distance_z cutoff (sensitivity): %.1f\n", params$distance_z_threshold))
+cat(sprintf("rec_scale       : %g\n", params$rec_scale))
+cat(sprintf("Output dir      : %s\n", params$output_dir))
+
+dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+### 1.1  MKT filter helper
+
+Genes are **analyzable** when they pass the McDonald-Kreitman filter for the
+branch-specific tests. Only these genes enter the recombination analysis.
+
+```{r mk_filter_helper}
+mk_filter_bs <- function(stats_df, min_poly, min_count) {
+  with(stats_df,
+    !is.na(num_pol_NS)         & num_pol_NS         >= min_count &
+    !is.na(num_pol_S)          & num_pol_S          >= min_count &
+    !is.na(Dn_branch_specific) & Dn_branch_specific >= min_count &
+    !is.na(Ds_branch_specific) & Ds_branch_specific >= min_count &
+    (num_pol_NS + num_pol_S)   >= min_poly
+  )
+}
+```
+
+### 1.2  Load and assemble per-species data
+
+For each species the following inputs are read:
+
+| Source | Description |
+|--------|-------------|
+| `branch_specific_MKT_results.tsv` | MKT statistics — defines analyzable universe |
+| `candidates_branch_specific.tsv` or `candidates_all.tsv` | Positive candidates → binary response |
+| `gene_coords_bed` | Gene genomic coordinates (chr, start, end, gene_id) |
+| `rec_map_bed` | Recombination rate intervals (chr, start, end, rec_rate) |
+
+The `selection` column (0/1) is derived from whether a gene appears in the
+candidate table. The analyzable filter restricts the universe to genes with
+valid branch-specific divergence counts.
+
+```{r load_species}
+load_species <- function(sp, cfg, cand_type, min_poly, min_count) {
+
+  # ── MKT results ──────────────────────────────────────────────────────────────
+  stats_file <- file.path(cfg$output_dir, "branch_specific_MKT_results.tsv")
+  if (cand_type == "bs") {
+    cand_file <- file.path(cfg$output_dir, "candidates_branch_specific.tsv")
+  } else {
+    cand_file <- file.path(cfg$output_dir, "candidates_all.tsv")
+  }
+
+  for (f in c(stats_file, cand_file, cfg$gene_coords_bed, cfg$rec_map_bed)) {
+    if (!file.exists(f))
+      stop(sprintf("[%s] File not found: %s\nRun render_analysis.R first,\n",
+                   sp, f),
+           "then check that gene_coords_bed and rec_map_bed paths are correct.")
+  }
+
+  stats <- read_tsv(stats_file,
+                    col_types = cols(.default = col_double(),
+                                     gene_id  = col_character(),
+                                     ortholog = col_character()),
+                    na = c("NA", "NaN", ""))
+
+  cands <- read_tsv(cand_file,
+                    col_types = cols(.default = col_character()),
+                    na = c("NA", "NaN", ""))
+
+  # Analyzable genes = genes passing branch-specific MKT filter
+  analyzable_ids <- stats$gene_id[mk_filter_bs(stats, min_poly, min_count)]
+
+  # Positive candidate gene IDs
+  candidate_ids <- unique(cands$gene_id)
+
+  # ── Gene coordinates BED ─────────────────────────────────────────────────────
+  genes_raw <- read_tsv(cfg$gene_coords_bed,
+                        col_names = c("chr", "start", "end", "gene_id"),
+                        col_types = cols(chr   = col_character(),
+                                         start = col_integer(),
+                                         end   = col_integer(),
+                                         gene_id = col_character()),
+                        na = c("NA", ""))
+
+  # Restrict to analyzable genes and add binary selection status
+  genes <- genes_raw %>%
+    filter(gene_id %in% analyzable_ids) %>%
+    mutate(selection = as.integer(gene_id %in% candidate_ids))
+
+  # ── Recombination map BED ────────────────────────────────────────────────────
+  rec <- read_tsv(cfg$rec_map_bed,
+                  col_names = c("chr", "start", "end", "rec_rate"),
+                  col_types = cols(chr      = col_character(),
+                                   start    = col_integer(),
+                                   end      = col_integer(),
+                                   rec_rate = col_double()),
+                  na = c("NA", ""))
+  rec <- rec[!is.na(rec$rec_rate), , drop = FALSE]
+
+  list(
+    sp            = sp,
+    cfg           = cfg,
+    stats         = stats,
+    analyzable_ids = analyzable_ids,
+    candidate_ids  = candidate_ids,
+    genes         = genes,
+    rec           = rec
+  )
+}
+
+raw_data <- setNames(
+  lapply(sp_labels, function(sp)
+    load_species(sp, params$species_configs[[sp]],
+                 cand_type, params$min_poly, params$min_count)),
+  sp_labels
+)
+```
+
+```{r input_summary}
+summary_rows <- lapply(sp_labels, function(sp) {
+  d <- raw_data[[sp]]
+  tibble(
+    Species           = sp,
+    Genes_total       = nrow(raw_data[[sp]]$stats),
+    Analyzable        = length(d$analyzable_ids),
+    Candidates        = length(d$candidate_ids),
+    Genes_in_BED      = nrow(raw_data[[sp]]$genes),
+    Selected_in_BED   = sum(raw_data[[sp]]$genes$selection),
+    Rec_intervals     = nrow(d$rec),
+    Chrs_genes        = n_distinct(d$genes$chr),
+    Chrs_rec          = n_distinct(d$rec$chr)
+  )
+})
+
+bind_rows(summary_rows) %>%
+  kbl(caption = "Input data summary") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+---
+
+## 2  GenomicRanges: assign recombination rate to each gene
+
+Each gene receives a recombination rate by:
+1. **Overlap**: the mean rec rate of all overlapping intervals (preferred)
+2. **Nearest**: the rec rate of the nearest non-overlapping interval
+3. **Population mean**: mean across all intervals (fallback when no nearest found)
+
+The distance from each gene to its assigned interval is computed and log-
+transformed then standardised (`distance_z`) to enter the model as a continuous
+covariate. For overlapping genes `distance_z = 0`.
+
+Only genes on chromosomes that have recombination data are retained.
+
+```{r assign_recombination}
+assign_rec <- function(sp, data_list, rec_scale) {
+  d     <- data_list[[sp]]
+  genes <- d$genes
+  rec   <- d$rec
+
+  chrs_rec   <- unique(rec$chr)
+  chrs_genes <- unique(genes$chr)
+  chrs_no_rec <- setdiff(chrs_genes, chrs_rec)
+
+  if (length(chrs_no_rec) > 0)
+    warning(sprintf("[%s] %d chromosomes in gene BED have NO recombination data: %s",
+                    sp, length(chrs_no_rec),
+                    paste(chrs_no_rec, collapse = ", ")))
+
+  genes <- genes[genes$chr %in% chrs_rec, , drop = FALSE]
+
+  if (nrow(genes) == 0)
+    stop(sprintf("[%s] No genes remain after restricting to chromosomes with ",
+                 sp),
+         "recombination data. Check chromosome naming between BEDs.")
+
+  gr_genes <- GRanges(seqnames = genes$chr,
+                      ranges   = IRanges(start = genes$start, end = genes$end),
+                      gene_id   = genes$gene_id,
+                      selection = genes$selection,
+                      gene_idx  = seq_len(nrow(genes)))
+
+  gr_rec   <- GRanges(seqnames = rec$chr,
+                      ranges   = IRanges(start = rec$start, end = rec$end),
+                      rec_rate = rec$rec_rate)
+
+  # ── Step 1: overlap assignment ───────────────────────────────────────────────
+  overlaps <- findOverlaps(gr_genes, gr_rec, ignore.strand = TRUE)
+  if (length(overlaps) > 0) {
+    ovl_df <- data.frame(
+      gene_idx = queryHits(overlaps),
+      rec_rate = mcols(gr_rec)$rec_rate[subjectHits(overlaps)],
+      stringsAsFactors = FALSE
+    )
+    ovl_df <- aggregate(rec_rate ~ gene_idx, data = ovl_df, FUN = mean)
+    n_per_gene <- as.data.frame(table(queryHits(overlaps)), stringsAsFactors = FALSE)
+    names(n_per_gene) <- c("gene_idx", "n_overlaps")
+    ovl_df <- merge(ovl_df, n_per_gene, by = "gene_idx", all.x = TRUE)
+    ovl_df$assignment_method        <- "overlap"
+    ovl_df$distance_to_interval_kb  <- 0
+    genes_with_overlap <- unique(ovl_df$gene_idx)
+  } else {
+    ovl_df <- data.frame()
+    genes_with_overlap <- integer(0)
+  }
+
+  # ── Step 2: nearest assignment ───────────────────────────────────────────────
+  genes_no_overlap <- setdiff(seq_along(gr_genes), genes_with_overlap)
+  if (length(genes_no_overlap) > 0) {
+    nearest_idx  <- nearest(gr_genes[genes_no_overlap], gr_rec, ignore.strand = TRUE)
+    dist_obj     <- distanceToNearest(gr_genes[genes_no_overlap], gr_rec, ignore.strand = TRUE)
+    has_nearest  <- !is.na(nearest_idx)
+
+    if (any(has_nearest)) {
+      near_df <- data.frame(
+        gene_idx               = genes_no_overlap[has_nearest],
+        rec_rate               = mcols(gr_rec)$rec_rate[nearest_idx[has_nearest]],
+        distance_to_interval_kb = mcols(dist_obj)$distance[has_nearest] / 1000,
+        assignment_method      = "nearest",
+        stringsAsFactors       = FALSE
+      )
+    } else {
+      near_df <- data.frame()
+    }
+
+    # Step 3: population-mean fallback
+    genes_no_nearest <- genes_no_overlap[!has_nearest]
+    if (length(genes_no_nearest) > 0) {
+      fallback_df <- data.frame(
+        gene_idx               = genes_no_nearest,
+        rec_rate               = mean(rec$rec_rate, na.rm = TRUE),
+        distance_to_interval_kb = NA_real_,
+        assignment_method      = "population_mean",
+        stringsAsFactors       = FALSE
+      )
+      near_df <- bind_rows(near_df, fallback_df)
+    }
+  } else {
+    near_df <- data.frame()
+  }
+
+  # ── Assemble combined data frame ─────────────────────────────────────────────
+  # Use select() rather than [, c(...)] so empty data frames (0 rows, 0 cols)
+  # don't crash — bind_rows() handles empty tibbles cleanly.
+  cols_keep <- c("gene_idx", "rec_rate", "assignment_method", "distance_to_interval_kb")
+  safe_sel  <- function(df) {
+    if (nrow(df) == 0)
+      return(tibble(gene_idx = integer(), rec_rate = double(),
+                    assignment_method = character(), distance_to_interval_kb = double()))
+    df[, cols_keep]
+  }
+
+  combined <- bind_rows(safe_sel(ovl_df), safe_sel(near_df)) %>%
+    arrange(gene_idx) %>%
+    mutate(
+      gene_id          = mcols(gr_genes)$gene_id[gene_idx],
+      selection        = as.integer(mcols(gr_genes)$selection[gene_idx]),
+      chr              = as.character(seqnames(gr_genes))[gene_idx],
+      pos              = (start(gr_genes) + end(gr_genes))[gene_idx] / 2,
+      rec_rate_scaled  = rec_rate * rec_scale,
+      distance_z       = as.numeric(scale(log1p(distance_to_interval_kb)))
+    )
+
+  list(
+    combined       = combined,
+    gr_genes       = gr_genes,
+    gr_rec         = gr_rec,
+    chrs_no_rec    = chrs_no_rec
+  )
+}
+
+assigned <- setNames(
+  lapply(sp_labels, function(sp) assign_rec(sp, raw_data, params$rec_scale)),
+  sp_labels
+)
+```
+
+```{r assignment_summary}
+assign_tbl <- bind_rows(lapply(sp_labels, function(sp) {
+  df <- assigned[[sp]]$combined
+  tibble(
+    Species         = sp,
+    n_analyzed      = nrow(df),
+    n_selected      = sum(df$selection == 1, na.rm = TRUE),
+    n_overlap       = sum(df$assignment_method == "overlap"),
+    n_nearest       = sum(df$assignment_method == "nearest"),
+    n_pop_mean      = sum(df$assignment_method == "population_mean"),
+    pct_direct      = round(100 * sum(df$assignment_method == "overlap") / nrow(df), 1),
+    median_rec      = round(median(df$rec_rate, na.rm = TRUE), 6),
+    NAs_distance_z  = sum(is.na(df$distance_z))
+  )
+}))
+
+assign_tbl %>%
+  kbl(caption = "Recombination rate assignment summary") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+```{r plot_assignment_methods, fig.cap="Recombination rate distributions by assignment method. Genes with direct overlap assignments are in blue; nearest-interval and population-mean fallbacks in other colours."}
+plots_assign <- lapply(sp_labels, function(sp) {
+  assigned[[sp]]$combined %>%
+    ggplot(aes(x = rec_rate_scaled, fill = assignment_method,
+               colour = assignment_method)) +
+    geom_histogram(bins = 40, alpha = 0.7, position = "identity") +
+    scale_fill_manual(values = c(overlap = "#4C72B0", nearest = "#DD8452",
+                                  population_mean = "#8C8C8C")) +
+    scale_colour_manual(values = c(overlap = "#4C72B0", nearest = "#DD8452",
+                                    population_mean = "#8C8C8C"), guide = "none") +
+    labs(title = sp,
+         x     = paste("Recombination rate (", rec_unit_label, ")"),
+         y     = "Genes", fill  = "Assignment") +
+    theme_classic(base_size = 11) +
+    theme(legend.position = "bottom")
+})
+
+wrap_plots(plots_assign, ncol = min(2, n_species))
+```
+
+---
+
+## 3  Recombination rate vs selection status
+
+```{r plot_rec_vs_selection, fig.cap="Recombination rate distributions for selected vs non-selected genes."}
+plots_rec <- lapply(sp_labels, function(sp) {
+  df <- assigned[[sp]]$combined %>%
+    mutate(group = if_else(selection == 1, "Candidate", "Background"))
+
+  ggplot(df, aes(x = rec_rate_scaled, fill = group, colour = group)) +
+    geom_density(alpha = 0.45, adjust = 1.5) +
+    scale_fill_manual(values   = c(Candidate = "#C44E52", Background = "#4C72B0")) +
+    scale_colour_manual(values = c(Candidate = "#C44E52", Background = "#4C72B0"),
+                        guide  = "none") +
+    labs(title = sp,
+         x     = paste("Recombination rate (", rec_unit_label, ")"),
+         y     = "Density", fill = NULL) +
+    theme_classic(base_size = 11) +
+    theme(legend.position = "bottom")
+})
+
+wrap_plots(plots_rec, ncol = min(2, n_species))
+```
+
+```{r rec_medians}
+med_tbl <- bind_rows(lapply(sp_labels, function(sp) {
+  assigned[[sp]]$combined %>%
+    mutate(group = if_else(selection == 1, "Candidate", "Background")) %>%
+    group_by(Species = sp, group) %>%
+    summarise(n = n(),
+              median_rec = signif(median(rec_rate_scaled, na.rm = TRUE), 4),
+              mean_rec   = signif(mean(rec_rate_scaled,   na.rm = TRUE), 4),
+              .groups = "drop")
+}))
+
+med_tbl %>%
+  kbl(caption = "Median recombination rate — candidates vs background") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+---
+
+## 4  Binomial logistic GLM
+
+### 4.1  Main model
+
+$$\text{logit}(P[\text{selected}]) = \beta_0 + \beta_1 \cdot \text{rec\_rate\_scaled} + \beta_2 \cdot \text{distance\_z}$$
+
+- `rec_rate_scaled` tests whether recombination rate predicts positive selection
+  probability after accounting for assignment uncertainty.
+- `distance_z` captures the effect of assignment uncertainty; a large positive
+  coefficient indicates that genes far from measured intervals behave differently.
+
+```{r glm_main}
+fit_models <- function(sp) {
+  df <- assigned[[sp]]$combined %>%
+    filter(!is.na(selection), !is.na(rec_rate_scaled))
+
+  main        <- glm(selection ~ rec_rate_scaled + distance_z,
+                     family = binomial(link = "logit"), data = df)
+  interaction <- glm(selection ~ rec_rate_scaled * distance_z,
+                     family = binomial(link = "logit"), data = df)
+  list(main = main, interaction = interaction, data = df)
+}
+
+models <- setNames(lapply(sp_labels, fit_models), sp_labels)
+
+for (sp in sp_labels) {
+  cat(sprintf("\n### Main model — %s\n\n", sp))
+  print(summary(models[[sp]]$main))
+}
+```
+
+### 4.2  Interaction model and LRT
+
+```{r glm_interaction}
+for (sp in sp_labels) {
+  cat(sprintf("\n### Interaction model — %s\n\n", sp))
+  print(summary(models[[sp]]$interaction))
+  cat(sprintf("\nLikelihood-ratio test (main vs interaction) — %s\n", sp))
+  print(anova(models[[sp]]$main, models[[sp]]$interaction, test = "Chisq"))
+}
+```
+
+### 4.3  Model coefficient table
+
+```{r glm_coef_table}
+coef_tbl <- bind_rows(lapply(sp_labels, function(sp) {
+  coef_mat <- coef(summary(models[[sp]]$main))
+  as.data.frame(coef_mat) %>%
+    rownames_to_column("term") %>%
+    mutate(
+      Species    = sp,
+      odds_ratio = round(exp(Estimate), 4),
+      Estimate   = round(Estimate, 5),
+      `Std. Error` = round(`Std. Error`, 5),
+      `z value`    = round(`z value`, 3),
+      `Pr(>|z|)`   = signif(`Pr(>|z|)`, 4)
+    ) %>%
+    select(Species, term, Estimate, `Std. Error`, `z value`, `Pr(>|z|)`, odds_ratio)
+}))
+
+coef_tbl %>%
+  kbl(caption = "Main GLM coefficients (all species)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  row_spec(which(coef_tbl$`Pr(>|z|)` < 0.05), bold = TRUE)
+```
+
+```{r plot_coef, fig.cap="Estimated odds ratios (OR) for the recombination rate coefficient. OR > 1: positive relationship between recombination and candidate status."}
+rec_coefs <- filter(coef_tbl, term == "rec_rate_scaled")
+
+ggplot(rec_coefs, aes(x = Species, y = odds_ratio, ymin = exp(Estimate - 1.96 * `Std. Error`),
+                       ymax = exp(Estimate + 1.96 * `Std. Error`))) +
+  geom_pointrange(colour = "#4C72B0", size = 1) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey40") +
+  labs(title = "Odds ratio for recombination rate (95% CI)",
+       x = NULL, y = "Odds ratio (rec_rate_scaled)") +
+  theme_classic(base_size = 11)
+```
+
+---
+
+## 5  Sensitivity analysis — distance-z filter
+
+Genes with `|distance_z|` > `r params$distance_z_threshold` are excluded.
+This tests whether the recombination coefficient is driven by genes assigned
+from very distant recombination intervals.
+
+```{r sensitivity_analysis}
+sens_results <- bind_rows(lapply(sp_labels, function(sp) {
+  df_full <- models[[sp]]$data
+  df_filt <- filter(df_full, !is.na(distance_z),
+                    abs(distance_z) <= params$distance_z_threshold)
+
+  n_total    <- nrow(df_full)
+  n_retained <- nrow(df_filt)
+  n_excluded <- n_total - n_retained
+
+  cat(sprintf("\n[%s] distance_z filter (|z| <= %.1f):\n",
+              sp, params$distance_z_threshold))
+  cat(sprintf("  Total: %d  |  Retained: %d  |  Excluded: %d (%.1f%%)\n",
+              n_total, n_retained, n_excluded, 100 * n_excluded / n_total))
+
+  if (n_retained == 0) {
+    warning(sprintf("[%s] No genes retained after sensitivity filter.", sp))
+    return(NULL)
+  }
+
+  m_filt  <- glm(selection ~ rec_rate_scaled + distance_z,
+                 family = binomial(link = "logit"), data = df_filt)
+  cf_full <- coef(summary(models[[sp]]$main))["rec_rate_scaled", ]
+  cf_filt <- coef(summary(m_filt))["rec_rate_scaled", ]
+
+  tibble(
+    species          = sp,
+    n_total          = n_total,
+    n_retained       = n_retained,
+    n_excluded       = n_excluded,
+    full_estimate    = round(unname(cf_full["Estimate"]),      5),
+    full_OR          = round(exp(unname(cf_full["Estimate"])), 4),
+    full_p           = signif(unname(cf_full["Pr(>|z|)"]),     4),
+    filtered_estimate = round(unname(cf_filt["Estimate"]),      5),
+    filtered_OR       = round(exp(unname(cf_filt["Estimate"])), 4),
+    filtered_p        = signif(unname(cf_filt["Pr(>|z|)"]),     4)
+  )
+}))
+
+sens_results %>%
+  kbl(caption = sprintf("Full model vs sensitivity-filtered model (|distance_z| <= %.1f)",
+                        params$distance_z_threshold)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+---
+
+## 6  Genomic distribution
+
+```{r plot_genomic, fig.cap="Genomic distribution of recombination rate and selection candidates."}
+plots_genome <- lapply(sp_labels, function(sp) {
+  df <- assigned[[sp]]$combined
+
+  ggplot(df, aes(x = pos / 1e6, y = rec_rate_scaled)) +
+    geom_point(aes(colour = factor(selection)), alpha = 0.4, size = 0.7) +
+    geom_smooth(method = "loess", se = FALSE, colour = "grey30", linewidth = 0.8) +
+    facet_wrap(~chr, scales = "free_x") +
+    scale_colour_manual(
+      values = c("0" = "#AAAAAA", "1" = "#C44E52"),
+      labels = c("0" = "Background", "1" = "Candidate")
+    ) +
+    labs(title  = sp,
+         x      = "Position (Mb)",
+         y      = paste("Rec rate (", rec_unit_label, ")"),
+         colour = NULL) +
+    theme_classic(base_size = 9) +
+    theme(strip.text = element_text(size = 8), legend.position = "bottom")
+})
+
+for (p in plots_genome) print(p)
+```
+
+---
+
+## 7  Write output tables
+
+```{r write_outputs}
+# Combined assignment table (all species)
+combined_all <- bind_rows(lapply(sp_labels, function(sp) {
+  assigned[[sp]]$combined %>% mutate(species = sp)
+}))
+
+write_tsv(combined_all,
+          file.path(params$output_dir, "gene_recombination_assignments.tsv"),
+          na = "NA")
+
+# GLM coefficient tables
+write_tsv(coef_tbl,
+          file.path(params$output_dir, "glm_coefficients.tsv"),
+          na = "NA")
+
+# Sensitivity results
+if (nrow(sens_results) > 0)
+  write_tsv(sens_results,
+            file.path(params$output_dir, "sensitivity_analysis.tsv"),
+            na = "NA")
+
+cat("Output files written to:", params$output_dir, "\n")
+cat("  gene_recombination_assignments.tsv\n")
+cat("  glm_coefficients.tsv\n")
+cat("  sensitivity_analysis.tsv\n")
+```
+
+---
+
+## Session info
+
+```{r session_info}
+sessionInfo()
+```

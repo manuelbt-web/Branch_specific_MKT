@@ -1,0 +1,843 @@
+---
+title: "`r params$experiment_name`"
+author: ""
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: yes
+    toc_depth: 3
+    code_folding: hide
+    df_print: paged
+params:
+  experiment_name: "Gene Set MK Analysis (2DNS)"
+  species_configs: !r list()
+  min_genes: 8
+  n_permutations: 1000
+  length_strata_n: 5
+  fisher_p_threshold: 0.05
+  fdr_q_threshold: 0.05
+  perm_p_threshold: 0.05
+  seed: 123
+  candidate_type: "bs_any"
+  output_dir: "results/2dns"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 10,
+  fig.height = 5
+)
+set.seed(params$seed)
+```
+
+```{r packages, include=FALSE}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(kableExtra)
+  library(patchwork)
+})
+```
+
+```{r helpers, include=FALSE}
+
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# ── Statistical helpers ────────────────────────────────────────────────────────
+
+safe_fisher <- function(mat, alternative = c("two.sided", "greater")) {
+  alternative <- match.arg(alternative)
+  if (any(!is.finite(mat)) || any(rowSums(mat) == 0) || any(colSums(mat) == 0))
+    return(list(p.value = NA_real_, estimate = NA_real_))
+  res <- tryCatch(fisher.test(mat, alternative = alternative), error = function(e) NULL)
+  if (is.null(res)) return(list(p.value = NA_real_, estimate = NA_real_))
+  list(p.value  = unname(res$p.value),
+       estimate = if (!is.null(res$estimate)) unname(as.numeric(res$estimate)) else NA_real_)
+}
+
+mk_statistic <- function(PN, PS, DN, DS) {
+  log((DN + 0.5) / (DS + 0.5)) - log((PN + 0.5) / (PS + 0.5))
+}
+
+make_length_breaks <- function(lengths, n_strata = 5L) {
+  if (length(lengths) < 3 || all(is.na(lengths))) return(NULL)
+  breaks <- unique(as.numeric(quantile(lengths,
+    probs = seq(0, 1, length.out = n_strata + 1L), na.rm = TRUE, type = 7)))
+  if (length(breaks) < 3L) NULL else breaks
+}
+
+assign_length_strata <- function(lengths, breaks) {
+  if (is.null(breaks)) return(rep.int(1L, length(lengths)))
+  as.integer(cut(lengths, breaks = breaks, include.lowest = TRUE, labels = FALSE))
+}
+
+# ── MKT data helpers ───────────────────────────────────────────────────────────
+
+mk_filter_bs <- function(df) {
+  df %>% filter(
+    !is.na(num_pol_NS) & num_pol_NS >= 1,
+    !is.na(num_pol_S)  & num_pol_S  >= 1,
+    !is.na(Dn_branch_specific) & Dn_branch_specific >= 1,
+    !is.na(Ds_branch_specific) & Ds_branch_specific >= 1,
+    (num_pol_NS + num_pol_S) >= 5
+  )
+}
+
+get_positive_flag <- function(df, type) {
+  switch(type,
+    bs_impMKT = df$pos_branch_specific_impMKT %in% TRUE,
+    bs_mkt    = df$pos_branch_specific_MKT    %in% TRUE,
+    bs_any    = (df$pos_branch_specific_impMKT %in% TRUE) | (df$pos_branch_specific_MKT %in% TRUE),
+    any       = (df$pos_standard_MKT %in% TRUE) | (df$pos_standard_impMKT %in% TRUE) |
+                (df$pos_branch_specific_MKT %in% TRUE) | (df$pos_branch_specific_impMKT %in% TRUE),
+    stop("Unknown candidate_type: '", type, "'. Use one of: bs_any, bs_impMKT, bs_mkt, any")
+  )
+}
+
+get_ortholog_col <- function(df) {
+  # branch_specific_MKT_results.tsv uses 'ortholog'; some versions rename to 'aestivum_ortholog'
+  for (col in c("aestivum_ortholog", "ortholog")) {
+    if (col %in% names(df)) return(col)
+  }
+  NA_character_
+}
+
+load_mkt_data <- function(output_dir, candidate_type) {
+  f <- file.path(output_dir, "branch_specific_MKT_results.tsv")
+  if (!file.exists(f))
+    stop("File not found: ", f, "\n  -> Run branch_specific_MKT/render_analysis.R first.")
+  mkt <- read_tsv(f, show_col_types = FALSE) %>% mk_filter_bs()
+  mkt %>% mutate(is_candidate = get_positive_flag(., candidate_type))
+}
+
+build_gene_pool <- function(mkt) {
+  len_val <- if ("number_sites" %in% names(mkt)) {
+    as.numeric(mkt$number_sites)
+  } else {
+    as.numeric(mkt$num_pol_NS + mkt$num_pol_S)
+  }
+  tibble(
+    gene_id = mkt$gene_id,
+    PN      = as.numeric(mkt$num_pol_NS),
+    PS      = as.numeric(mkt$num_pol_S),
+    DN      = as.numeric(mkt$Dn_branch_specific),
+    DS      = as.numeric(mkt$Ds_branch_specific),
+    length  = len_val
+  ) %>%
+    filter(if_all(c(PN, PS, DN, DS, length), is.finite), length > 0) %>%
+    distinct(gene_id, .keep_all = TRUE)
+}
+
+# ── Analysis layers ────────────────────────────────────────────────────────────
+
+run_fisher_analysis <- function(tbl, species, min_genes = 8L) {
+  required <- c("pathway_name", "PN", "PS", "DN", "DS", "n_genes")
+  miss <- setdiff(required, names(tbl))
+  if (length(miss) > 0)
+    stop("Input CSV for '", species, "' is missing columns: ", paste(miss, collapse = ", "))
+
+  tbl %>%
+    transmute(
+      pathways   = pathway_name,
+      PN = as.numeric(PN), PS = as.numeric(PS),
+      DN = as.numeric(DN), DS = as.numeric(DS),
+      n_genes    = as.numeric(n_genes),
+      set_length = if ("set_length" %in% names(tbl)) as.numeric(set_length) else NA_real_
+    ) %>%
+    filter(!is.na(pathways), pathways != "", n_genes >= min_genes,
+           if_all(c(PN, PS, DN, DS), is.finite)) %>%
+    rowwise() %>%
+    mutate(
+      mat    = list(matrix(c(DN, DS, PN, PS), 2, byrow = TRUE)),
+      res_2s = list(safe_fisher(mat, "two.sided")),
+      res_gt = list(safe_fisher(mat, "greater"))
+    ) %>%
+    ungroup() %>%
+    mutate(
+      odds_ratio  = map_dbl(res_gt, "estimate"),
+      p_two_sided = map_dbl(res_2s, "p.value"),
+      p_greater   = map_dbl(res_gt, "p.value"),
+      direction   = case_when(
+        is.na(odds_ratio) ~ NA_character_,
+        odds_ratio > 1    ~ "DN/DS > PN/PS",
+        odds_ratio < 1    ~ "DN/DS < PN/PS",
+        TRUE              ~ "DN/DS = PN/PS"
+      ),
+      species = species
+    ) %>%
+    select(species, pathways, n_genes, set_length, PN, PS, DN, DS,
+           odds_ratio, direction, p_two_sided, p_greater) %>%
+    arrange(p_two_sided)
+}
+
+# Permutation null: sample n_genes from the MKT gene pool, stratified by gene
+# length (using overall pool length distribution, since gene-pathway membership
+# is not available from branch_specific_MKT_results.tsv).
+run_permutation <- function(obs_row, gene_pool, length_breaks, n_perm = 1000L) {
+  n_genes  <- as.integer(obs_row$n_genes)
+  obs_stat <- mk_statistic(obs_row$PN, obs_row$PS, obs_row$DN, obs_row$DS)
+
+  na_row <- tibble(
+    n_permutations   = n_perm,
+    observed_stat    = obs_stat,
+    perm_p_one_sided = NA_real_,
+    perm_p_two_sided = NA_real_,
+    perm_stat_median = NA_real_,
+    perm_stat_q025   = NA_real_,
+    perm_stat_q975   = NA_real_
+  )
+
+  if (!is.finite(obs_stat) || !is.finite(n_genes) || n_genes < 2 || nrow(gene_pool) == 0)
+    return(na_row)
+
+  pool <- gene_pool %>%
+    mutate(length_stratum = assign_length_strata(length, length_breaks))
+
+  strata_tbl <- pool %>%
+    count(length_stratum) %>%
+    mutate(target_n = pmax(1L, as.integer(round(n_genes * n / sum(n)))))
+
+  perm_stats <- vapply(seq_len(n_perm), function(i) {
+    sampled <- bind_rows(lapply(seq_len(nrow(strata_tbl)), function(j) {
+      s   <- strata_tbl$length_stratum[j]
+      n_s <- strata_tbl$target_n[j]
+      cands <- pool %>% filter(length_stratum == s)
+      if (nrow(cands) == 0) cands <- pool
+      cands %>% slice_sample(n = n_s, replace = n_s > nrow(cands))
+    }))
+    mk_statistic(sum(sampled$PN), sum(sampled$PS), sum(sampled$DN), sum(sampled$DS))
+  }, numeric(1))
+
+  tibble(
+    n_permutations   = n_perm,
+    observed_stat    = obs_stat,
+    perm_p_one_sided = (1 + sum(perm_stats >= obs_stat, na.rm = TRUE)) / (n_perm + 1),
+    perm_p_two_sided = (1 + sum(abs(perm_stats) >= abs(obs_stat), na.rm = TRUE)) / (n_perm + 1),
+    perm_stat_median = median(perm_stats, na.rm = TRUE),
+    perm_stat_q025   = unname(quantile(perm_stats, 0.025, na.rm = TRUE)),
+    perm_stat_q975   = unname(quantile(perm_stats, 0.975, na.rm = TRUE))
+  )
+}
+
+# Jackknife: leave-one-gene-out Fisher test on pathway.
+# Requires gene_level_data with columns: gene_id, pathway_name, PN, PS, DN, DS.
+run_jackknife <- function(pathway_id, species_name, gene_level_data,
+                          min_genes = 8L, p_threshold = 0.05) {
+  if (is.null(gene_level_data)) return(NULL)
+  req <- c("gene_id", "pathway_name", "PN", "PS", "DN", "DS")
+  if (!all(req %in% names(gene_level_data))) return(NULL)
+
+  pw_genes <- gene_level_data %>%
+    filter(pathway_name == pathway_id) %>%
+    transmute(
+      gene_id = as.character(gene_id),
+      PN = as.numeric(PN), PS = as.numeric(PS),
+      DN = as.numeric(DN), DS = as.numeric(DS)
+    ) %>%
+    filter(!is.na(gene_id), gene_id != "") %>%
+    distinct(gene_id, .keep_all = TRUE) %>%
+    filter(if_all(c(PN, PS, DN, DS), is.finite))
+
+  if (nrow(pw_genes) < min_genes) return(NULL)
+
+  obs_p <- safe_fisher(
+    matrix(c(sum(pw_genes$DN), sum(pw_genes$DS), sum(pw_genes$PN), sum(pw_genes$PS)),
+           2, byrow = TRUE), "two.sided"
+  )$p.value
+
+  bind_rows(lapply(seq_len(nrow(pw_genes)), function(i) {
+    red <- pw_genes[-i, ]
+    if (nrow(red) < max(2L, min_genes - 1L)) return(NULL)
+    jk_p <- safe_fisher(
+      matrix(c(sum(red$DN), sum(red$DS), sum(red$PN), sum(red$PS)), 2, byrow = TRUE),
+      "two.sided"
+    )$p.value
+    tibble(
+      species           = species_name,
+      pathway_id        = pathway_id,
+      removed_gene_id   = pw_genes$gene_id[i],
+      n_genes_retained  = nrow(red),
+      obs_p_two_sided   = obs_p,
+      jk_p_two_sided    = jk_p,
+      p_change          = jk_p - obs_p,
+      lost_significance = isTRUE(obs_p < p_threshold) & isTRUE(jk_p >= p_threshold)
+    )
+  })) %>% arrange(desc(p_change))
+}
+
+# Consistent kable style
+styled_kable <- function(df, caption = NULL) {
+  df %>%
+    kable(caption = caption) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE, position = "left")
+}
+```
+
+```{r load_data, include=FALSE}
+species_cfg   <- params$species_configs
+species_names <- names(species_cfg)
+
+if (length(species_cfg) == 0)
+  stop("params$species_configs is empty. Fill in SPECIES_LIST in render_2dns.R.")
+
+# Pathway-level Fisher inputs (input_2DNS_*.csv)
+fisher_inputs <- setNames(lapply(species_names, function(sp) {
+  read_csv(species_cfg[[sp]]$input_file, show_col_types = FALSE)
+}), species_names)
+
+# Gene-level MKT data for permutation background and candidates
+mkt_data <- setNames(lapply(species_names, function(sp) {
+  tryCatch(
+    load_mkt_data(species_cfg[[sp]]$output_dir, params$candidate_type),
+    error = function(e) { warning(sprintf("[%s] %s", sp, conditionMessage(e))); NULL }
+  )
+}), species_names)
+
+gene_pools <- setNames(lapply(species_names, function(sp) {
+  if (is.null(mkt_data[[sp]]))
+    return(tibble(gene_id = character(), PN = numeric(), PS = numeric(),
+                  DN = numeric(), DS = numeric(), length = numeric()))
+  build_gene_pool(mkt_data[[sp]])
+}), species_names)
+
+length_breaks_list <- setNames(lapply(species_names, function(sp) {
+  make_length_breaks(gene_pools[[sp]]$length, params$length_strata_n)
+}), species_names)
+
+# Optional gene-level pathway data for jackknife (user-provided)
+gene_level_data <- setNames(lapply(species_names, function(sp) {
+  glf <- species_cfg[[sp]]$gene_level_file
+  if (is.null(glf) || !file.exists(glf)) return(NULL)
+  read_csv(glf, show_col_types = FALSE)
+}), species_names)
+
+jackknife_available <- any(sapply(gene_level_data, Negate(is.null)))
+```
+
+---
+
+# Overview
+
+This report implements a multi-layer gene set MK test:
+
+| Layer | Test | Input |
+|-------|------|-------|
+| 1 | Fisher exact (two-sided + one-sided) | Pathway-level PN/PS/DN/DS aggregates |
+| 2 | Benjamini-Hochberg FDR | Layer 1 p-values |
+| 3 | Stratified permutation | MKT gene pool (length-matched null) |
+| 4 | Jackknife leave-one-out | Gene-level pathway data (optional) |
+
+Candidate genes (Layer type: **`r params$candidate_type`**) are identified from
+`branch_specific_MKT_results.tsv` in each species output directory.
+
+Gene pool for the permutation null is built from all MKT-analyzable genes
+(branch-specific filter: PN ≥ 1, PS ≥ 1, DN ≥ 1, DS ≥ 1, PN+PS ≥ 5).
+
+```{r overview_table, echo=FALSE}
+tibble(
+  Species    = species_names,
+  Label      = sapply(species_names, function(sp) species_cfg[[sp]]$label %||% sp),
+  `Pathways` = sapply(species_names, function(sp) nrow(fisher_inputs[[sp]])),
+  `Pool size`= sapply(species_names, function(sp) nrow(gene_pools[[sp]])),
+  `MKT file` = sapply(species_names, function(sp)
+    ifelse(is.null(mkt_data[[sp]]), "MISSING", "OK"))
+) %>%
+  styled_kable(caption = "Input summary")
+```
+
+---
+
+# Layer 1: Fisher Exact Test
+
+```{r fisher_run, include=FALSE}
+results_fisher <- bind_rows(lapply(species_names, function(sp) {
+  run_fisher_analysis(fisher_inputs[[sp]], sp, params$min_genes)
+})) %>%
+  group_by(species) %>%
+  mutate(
+    q_bh_two_sided = p.adjust(p_two_sided, method = "BH"),
+    q_bh_greater   = p.adjust(p_greater,   method = "BH")
+  ) %>%
+  ungroup()
+
+fisher_sig <- results_fisher %>%
+  filter(p_two_sided < params$fisher_p_threshold |
+         p_greater   < params$fisher_p_threshold)
+```
+
+## Summary
+
+```{r fisher_summary}
+results_fisher %>%
+  group_by(species) %>%
+  summarise(
+    `Pathways tested`     = n(),
+    `p < 0.05 (two-sided)` = sum(p_two_sided < params$fisher_p_threshold, na.rm = TRUE),
+    `p < 0.05 (one-sided)` = sum(p_greater   < params$fisher_p_threshold, na.rm = TRUE),
+    `q < 0.05 (BH, two-sided)` = sum(q_bh_two_sided < params$fdr_q_threshold, na.rm = TRUE),
+    `Median p (two-sided)` = round(median(p_two_sided, na.rm = TRUE), 4),
+    .groups = "drop"
+  ) %>%
+  rename(Species = species) %>%
+  styled_kable(caption = "Layer 1 Fisher test summary")
+```
+
+## P-value distributions
+
+```{r fisher_plots, fig.height=6}
+p1 <- ggplot(results_fisher, aes(p_two_sided)) +
+  geom_histogram(bins = 40, fill = "steelblue", alpha = 0.75) +
+  facet_wrap(~species, scales = "free_y") +
+  labs(x = "p-value (two-sided)", y = "Count",
+       title = "Two-sided Fisher test p-values") +
+  theme_minimal(base_size = 11)
+
+p2 <- results_fisher %>%
+  filter(!is.na(odds_ratio), is.finite(odds_ratio), odds_ratio > 0) %>%
+  ggplot(aes(odds_ratio)) +
+  geom_histogram(bins = 40, fill = "darkorange", alpha = 0.75) +
+  facet_wrap(~species, scales = "free_y") +
+  scale_x_log10() +
+  labs(x = "Odds ratio (log scale)", y = "Count",
+       title = "Fisher test odds ratio distributions") +
+  theme_minimal(base_size = 11)
+
+p1 / p2
+```
+
+## Significant pathways (raw p < `r params$fisher_p_threshold`)
+
+```{r fisher_sig_table}
+if (nrow(fisher_sig) == 0) {
+  cat("No pathways significant at p <", params$fisher_p_threshold, "\n")
+} else {
+  fisher_sig %>%
+    mutate(
+      `DN/DS` = round(DN / DS, 3),
+      `PN/PS` = round(PN / PS, 3),
+      p_two_sided = formatC(p_two_sided, format = "e", digits = 2),
+      p_greater   = formatC(p_greater,   format = "e", digits = 2)
+    ) %>%
+    select(Species = species, Pathway = pathways, `n genes` = n_genes,
+           DN, DS, `DN/DS`, PN, PS, `PN/PS`, direction,
+           `p (two-sided)` = p_two_sided, `p (one-sided)` = p_greater) %>%
+    styled_kable(caption = paste("Pathways with raw Fisher p <", params$fisher_p_threshold))
+}
+```
+
+---
+
+# Layer 2: BH FDR Correction
+
+```{r fdr_summary}
+fdr_sig <- results_fisher %>%
+  filter(q_bh_two_sided < params$fdr_q_threshold |
+         q_bh_greater   < params$fdr_q_threshold)
+
+results_fisher %>%
+  group_by(species) %>%
+  summarise(
+    `Pathways tested`         = n(),
+    `q < 0.05 (two-sided BH)` = sum(q_bh_two_sided < params$fdr_q_threshold, na.rm = TRUE),
+    `q < 0.05 (one-sided BH)` = sum(q_bh_greater   < params$fdr_q_threshold, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  rename(Species = species) %>%
+  styled_kable(caption = paste0("Layer 2 — BH FDR (threshold: ", params$fdr_q_threshold, ")"))
+```
+
+```{r fdr_plot}
+ggplot(results_fisher %>% filter(is.finite(p_two_sided)),
+       aes(x = -log10(p_two_sided), y = -log10(q_bh_two_sided),
+           colour = species, alpha = p_two_sided < params$fisher_p_threshold)) +
+  geom_point(size = 1.8) +
+  geom_hline(yintercept = -log10(params$fdr_q_threshold), linetype = "dashed", colour = "red") +
+  scale_alpha_manual(values = c(`FALSE` = 0.3, `TRUE` = 0.9), guide = "none") +
+  facet_wrap(~species) +
+  labs(x = "-log10(raw p)", y = "-log10(BH q)",
+       title = "Raw p vs BH-corrected q (two-sided)",
+       colour = "Species") +
+  theme_minimal(base_size = 11) + theme(legend.position = "none")
+```
+
+---
+
+# Layer 3: Stratified Permutation
+
+For each pathway significant at Layer 1, `r params$n_permutations` gene sets of
+the same size are drawn from the MKT-analyzable gene pool, stratified by gene
+length (proxy: total coding sites). The empirical p-value is the fraction of
+permuted MK statistics as extreme as the observed value (+1 continuity correction).
+
+**Note:** Because gene-to-pathway membership is not encoded in
+`branch_specific_MKT_results.tsv`, the length stratification uses the *overall*
+pool distribution rather than the pathway's specific gene composition. This is a
+conservative null model: it controls for gene-length bias without over-matching to
+the observed pathway.
+
+```{r perm_run, include=FALSE}
+.perm_empty <- tibble(
+  species = character(), pathways = character(), n_genes = integer(),
+  set_length = numeric(), PN = numeric(), PS = numeric(), DN = numeric(), DS = numeric(),
+  direction = character(), fisher_p_two_sided = numeric(), fisher_p_greater = numeric(),
+  n_permutations = integer(), observed_stat = numeric(),
+  perm_p_one_sided = numeric(), perm_p_two_sided = numeric(),
+  perm_stat_median = numeric(), perm_stat_q025 = numeric(), perm_stat_q975 = numeric(),
+  perm_q_two_sided = numeric(), perm_q_one_sided = numeric()
+)
+
+results_perm <- if (nrow(fisher_sig) == 0) {
+  .perm_empty
+} else {
+  bind_rows(lapply(seq_len(nrow(fisher_sig)), function(i) {
+    row <- fisher_sig[i, ]
+    sp  <- row$species
+    run_permutation(
+      obs_row       = row,
+      gene_pool     = gene_pools[[sp]],
+      length_breaks = length_breaks_list[[sp]],
+      n_perm        = params$n_permutations
+    ) %>%
+      mutate(
+        species            = sp,
+        pathways           = row$pathways,
+        n_genes            = row$n_genes,
+        set_length         = row$set_length,
+        PN = row$PN, PS = row$PS, DN = row$DN, DS = row$DS,
+        direction          = row$direction,
+        fisher_p_two_sided = row$p_two_sided,
+        fisher_p_greater   = row$p_greater
+      )
+  })) %>%
+    mutate(
+      perm_q_two_sided = p.adjust(perm_p_two_sided, method = "BH"),
+      perm_q_one_sided = p.adjust(perm_p_one_sided, method = "BH")
+    )
+}
+
+perm_sig <- results_perm %>%
+  filter(perm_p_two_sided < params$perm_p_threshold |
+         perm_p_one_sided < params$perm_p_threshold)
+```
+
+## Summary
+
+```{r perm_summary}
+if (nrow(results_perm) == 0) {
+  cat("No pathways entered the permutation step (none significant at Layer 1).\n")
+} else {
+  results_perm %>%
+    group_by(species) %>%
+    summarise(
+      `Pathways tested`       = n(),
+      `perm p < 0.05 (two-s)` = sum(perm_p_two_sided < params$perm_p_threshold, na.rm = TRUE),
+      `perm p < 0.05 (one-s)` = sum(perm_p_one_sided < params$perm_p_threshold, na.rm = TRUE),
+      `Median perm p`         = round(median(perm_p_two_sided, na.rm = TRUE), 4),
+      .groups = "drop"
+    ) %>%
+    rename(Species = species) %>%
+    styled_kable(caption = "Layer 3 permutation summary")
+}
+```
+
+## Fisher vs Permutation p-values
+
+```{r perm_plot}
+if (nrow(results_perm) > 0) {
+  ggplot(results_perm %>% filter(is.finite(fisher_p_two_sided), is.finite(perm_p_two_sided)),
+         aes(x = -log10(fisher_p_two_sided), y = -log10(perm_p_two_sided),
+             colour = species, size = n_genes)) +
+    geom_point(alpha = 0.7) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+    facet_wrap(~species) +
+    labs(x = "-log10(Fisher p, two-sided)",
+         y = "-log10(Permutation p, two-sided)",
+         title = "Fisher vs Permutation — two-sided p-values",
+         colour = "Species", size = "n genes") +
+    theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+}
+```
+
+## Significant pathways (permutation p < `r params$perm_p_threshold`)
+
+```{r perm_sig_table}
+if (nrow(perm_sig) == 0) {
+  cat("No pathways significant after permutation at p <", params$perm_p_threshold, "\n")
+} else {
+  perm_sig %>%
+    mutate(
+      `DN/DS`            = round(DN / DS, 3),
+      `PN/PS`            = round(PN / PS, 3),
+      perm_p_two_sided   = formatC(perm_p_two_sided,   format = "e", digits = 2),
+      perm_p_one_sided   = formatC(perm_p_one_sided,   format = "e", digits = 2),
+      fisher_p_two_sided = formatC(fisher_p_two_sided, format = "e", digits = 2),
+      set_length_kb      = if (!is.na(set_length[1])) round(set_length / 1000, 1) else NA_real_
+    ) %>%
+    select(Species = species, Pathway = pathways, `n genes` = n_genes,
+           `Length (kb)` = set_length_kb,
+           DN, DS, `DN/DS`, PN, PS, `PN/PS`, direction,
+           `Fisher p` = fisher_p_two_sided,
+           `Perm p (two-s)` = perm_p_two_sided,
+           `Perm p (one-s)` = perm_p_one_sided) %>%
+    styled_kable(caption = paste("Pathways with permutation p <", params$perm_p_threshold))
+}
+```
+
+---
+
+# Layer 4: Jackknife Sensitivity
+
+```{r jackknife_header, results='asis'}
+if (!jackknife_available) {
+  cat(
+    "> **Layer 4 skipped** — no gene-level pathway data provided.\n\n",
+    "> To enable the jackknife, add `gene_level_file = \"path/to/file.csv\"` to each\n",
+    "> species entry in `SPECIES_LIST` in `render_2dns.R`. The file must contain\n",
+    "> columns: `gene_id`, `pathway_name`, `PN`, `PS`, `DN`, `DS`.\n\n"
+  )
+}
+```
+
+```{r jackknife_run, include=FALSE, eval=jackknife_available}
+sig_pathways_for_jk <- perm_sig %>% distinct(species, pathways)
+
+jackknife_results <- bind_rows(lapply(seq_len(nrow(sig_pathways_for_jk)), function(i) {
+  sp <- sig_pathways_for_jk$species[i]
+  pw <- sig_pathways_for_jk$pathways[i]
+  run_jackknife(pw, sp, gene_level_data[[sp]],
+                min_genes   = params$min_genes,
+                p_threshold = params$perm_p_threshold)
+}))
+
+if (!is.null(jackknife_results) && nrow(jackknife_results) > 0) {
+  jackknife_summary <- jackknife_results %>%
+    group_by(species, pathway_id) %>%
+    summarise(
+      n_genes                  = n_genes_retained[1] + 1,
+      obs_p_two_sided          = obs_p_two_sided[1],
+      n_lost_significance      = sum(lost_significance, na.rm = TRUE),
+      max_p_change             = max(p_change,          na.rm = TRUE),
+      median_jk_p              = median(jk_p_two_sided, na.rm = TRUE),
+      robust                   = n_lost_significance == 0,
+      .groups = "drop"
+    )
+  outlier_genes <- jackknife_results %>%
+    filter(lost_significance) %>%
+    select(species, pathway = pathway_id, removed_gene_id, p_change)
+} else {
+  jackknife_summary <- tibble()
+  outlier_genes     <- tibble()
+}
+```
+
+```{r jackknife_output, eval=jackknife_available}
+if (jackknife_available) {
+  if (nrow(jackknife_summary) == 0) {
+    cat("No pathways entered the jackknife (none significant at permutation step).\n")
+  } else {
+    jackknife_summary %>%
+      mutate(
+        obs_p_two_sided = formatC(obs_p_two_sided, format = "e", digits = 2),
+        Robust          = ifelse(robust, "Yes", "No")
+      ) %>%
+      select(Species = species, Pathway = pathway_id, `n genes` = n_genes,
+             `Obs p` = obs_p_two_sided, `n genes driving signal` = n_lost_significance,
+             `Max p change` = max_p_change, Robust) %>%
+      styled_kable(caption = "Layer 4 jackknife summary")
+
+    if (nrow(outlier_genes) > 0) {
+      cat("\n**Influential genes (removal causes loss of significance):**\n\n")
+      outlier_genes %>%
+        styled_kable(caption = "Genes driving the pathway signal")
+    }
+  }
+}
+```
+
+---
+
+# BS Candidate Genes
+
+Candidate genes identified by `r params$candidate_type` from
+`branch_specific_MKT_results.tsv` (MKT filter applied).
+
+```{r candidates_load, include=FALSE}
+candidates_all <- bind_rows(lapply(species_names, function(sp) {
+  if (is.null(mkt_data[[sp]])) return(NULL)
+  df    <- mkt_data[[sp]]
+  orth  <- get_ortholog_col(df)
+  tibble(
+    species       = sp,
+    label         = species_cfg[[sp]]$label %||% sp,
+    gene_id       = df$gene_id,
+    ortholog      = if (!is.na(orth)) df[[orth]] else NA_character_,
+    is_candidate  = df$is_candidate,
+    PN = df$num_pol_NS, PS = df$num_pol_S,
+    DN = df$Dn_branch_specific, DS = df$Ds_branch_specific
+  ) %>% filter(is_candidate)
+}))
+```
+
+## Candidate gene counts
+
+```{r candidates_summary}
+bind_rows(lapply(species_names, function(sp) {
+  if (is.null(mkt_data[[sp]]))
+    return(tibble(Species = sp, Analyzable = NA, Candidates = NA, `With ortholog` = NA))
+  df       <- mkt_data[[sp]]
+  n_analyz <- nrow(df)
+  n_cand   <- sum(df$is_candidate, na.rm = TRUE)
+  orth     <- get_ortholog_col(df)
+  n_orth   <- if (!is.na(orth)) sum(!is.na(df[[orth]][df$is_candidate]), na.rm = TRUE) else NA
+  tibble(
+    Species         = species_cfg[[sp]]$label %||% sp,
+    Analyzable      = n_analyz,
+    Candidates      = n_cand,
+    `With ortholog` = n_orth,
+    `% of analyzable` = if (n_analyz > 0) round(100 * n_cand / n_analyz, 1) else NA_real_
+  )
+})) %>%
+  styled_kable(caption = paste("Candidate genes by species — type:", params$candidate_type))
+```
+
+## Candidate gene table
+
+```{r candidates_table}
+if (nrow(candidates_all) == 0) {
+  cat("No candidate genes found.\n")
+} else {
+  candidates_all %>%
+    mutate(
+      `DN/DS` = round(DN / DS, 3),
+      `PN/PS` = round(PN / PS, 3)
+    ) %>%
+    select(Species = label, `Gene ID` = gene_id, Ortholog = ortholog,
+           PN, PS, DN, DS, `DN/DS`, `PN/PS`) %>%
+    arrange(Species, `Gene ID`) %>%
+    styled_kable(caption = "BS candidate genes with MKT counts")
+}
+```
+
+> **Note:** Pathway membership of individual candidate genes cannot be determined
+> from `branch_specific_MKT_results.tsv` alone. To assess which pathways contain
+> candidate genes, provide a gene-level pathway annotation file via
+> `gene_level_file` in `render_2dns.R`.
+
+---
+
+# Comprehensive Summary
+
+```{r comprehensive_summary}
+summary_all <- results_fisher %>%
+  select(species, pathways, n_genes, DN, DS, PN, PS, p_two_sided, p_greater,
+         q_bh_two_sided) %>%
+  mutate(
+    `L1 Fisher`  = p_two_sided   < params$fisher_p_threshold |
+                   p_greater     < params$fisher_p_threshold,
+    `L2 BH FDR` = q_bh_two_sided < params$fdr_q_threshold
+  ) %>%
+  left_join(
+    results_perm %>% select(species, pathways, perm_p_two_sided, perm_p_one_sided),
+    by = c("species", "pathways")
+  ) %>%
+  mutate(
+    `L3 Permutation` = !is.na(perm_p_two_sided) &
+      (perm_p_two_sided < params$perm_p_threshold |
+       perm_p_one_sided < params$perm_p_threshold)
+  )
+
+# Add jackknife column if run and non-empty
+.jk_avail <- jackknife_available &&
+  exists("jackknife_summary") &&
+  is.data.frame(jackknife_summary) &&
+  nrow(jackknife_summary) > 0 &&
+  "pathway_id" %in% names(jackknife_summary)
+
+if (.jk_avail) {
+  summary_all <- summary_all %>%
+    left_join(jackknife_summary %>% select(species, pathways = pathway_id, robust),
+              by = c("species", "pathways")) %>%
+    rename(`L4 Robust` = robust)
+} else {
+  summary_all <- summary_all %>% mutate(`L4 Robust` = NA)
+}
+
+# Species-level counts
+summary_all %>%
+  group_by(species) %>%
+  summarise(
+    `Tested`          = n(),
+    `L1 Fisher`       = sum(`L1 Fisher`,       na.rm = TRUE),
+    `L2 BH FDR`       = sum(`L2 BH FDR`,       na.rm = TRUE),
+    `L3 Permutation`  = sum(`L3 Permutation`,   na.rm = TRUE),
+    `L4 Robust (JK)`  = sum(`L4 Robust` %in% TRUE),
+    .groups = "drop"
+  ) %>%
+  rename(Species = species) %>%
+  styled_kable(caption = "Pathways passing each layer per species")
+
+# Pathways passing Fisher + Permutation
+top_pathways <- summary_all %>%
+  filter(`L1 Fisher`, `L3 Permutation`) %>%
+  mutate(
+    `DN/DS`  = round(DN / DS, 3),
+    `PN/PS`  = round(PN / PS, 3),
+    `Fisher p` = formatC(p_two_sided,   format = "e", digits = 2),
+    `Perm p`   = formatC(perm_p_two_sided, format = "e", digits = 2)
+  ) %>%
+  select(Species = species, Pathway = pathways, `n genes` = n_genes,
+         `DN/DS`, `PN/PS`, `Fisher p`, `Perm p`, `L2 BH FDR`, `L4 Robust`)
+
+if (nrow(top_pathways) == 0) {
+  cat("No pathways passed both Fisher and permutation filters.\n")
+} else {
+  top_pathways %>%
+    styled_kable(caption = "Pathways passing Layer 1 (Fisher) and Layer 3 (Permutation)")
+}
+```
+
+---
+
+# Output files
+
+```{r write_outputs}
+dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Fisher results
+write_tsv(results_fisher,
+          file.path(params$output_dir, "fisher_results.tsv"),      na = "NA")
+
+# Permutation results
+if (nrow(results_perm) > 0)
+  write_tsv(results_perm,
+            file.path(params$output_dir, "permutation_results.tsv"), na = "NA")
+
+# Comprehensive summary
+write_tsv(summary_all,
+          file.path(params$output_dir, "comprehensive_summary.tsv"), na = "NA")
+
+# Candidates
+if (nrow(candidates_all) > 0)
+  write_tsv(candidates_all,
+            file.path(params$output_dir, "candidates.tsv"),          na = "NA")
+
+cat("TSV outputs written to:", params$output_dir, "\n",
+    " - fisher_results.tsv\n",
+    " - permutation_results.tsv\n",
+    " - comprehensive_summary.tsv\n",
+    " - candidates.tsv\n")
+```
+
+---
+
+# Session info
+
+```{r session_info}
+sessionInfo()
+```

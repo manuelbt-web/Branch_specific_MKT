@@ -1,0 +1,562 @@
+---
+title: "McDonald-Kreitman Test — Standard and Imputed MKT"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+    fig_caption: true
+params:
+  merged_table: "step7_merged.tsv"
+  output_table:  "step7_MKT_results.tsv"
+  species: "focal species"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r libraries}
+library(tidyverse)
+library(kableExtra)
+library(patchwork)
+```
+
+---
+
+## 1  Load merged table
+
+```{r load}
+df <- read_tsv(
+  params$merged_table,
+  col_types = cols(.default = col_double(), gene_id = col_character()),
+  na = c("NA", "NaN", "")
+)
+
+cat(sprintf("Loaded %d genes with %d columns\n", nrow(df), ncol(df)))
+cat(sprintf("Species : %s\n", params$species))
+cat(sprintf("Genes with Dn data : %d\n", sum(!is.na(df$Dn_counts))))
+cat(sprintf("Genes with Ds data : %d\n", sum(!is.na(df$Ds_counts))))
+```
+
+---
+
+## 2  Helper functions
+
+```{r helpers}
+# Fisher's exact test on the MK 2×2 table [[Pn, Dn], [Ps, Ds]]
+mk_fisher <- function(Pn, Ps, Dn, Ds) {
+  mapply(function(pn, ps, dn, ds) {
+    if (any(is.na(c(pn, ps, dn, ds)))) return(NA_real_)
+    if (any(c(pn, ps, dn, ds) < 0))   return(NA_real_)
+    tryCatch(
+      fisher.test(matrix(c(round(pn), round(ps), round(dn), round(ds)),
+                         nrow = 2))$p.value,
+      error = function(e) NA_real_
+    )
+  }, Pn, Ps, Dn, Ds, SIMPLIFY = TRUE)
+}
+
+# DoS = Dn/(Dn+Ds) − Pn/(Pn+Ps)  (Stoletzki & Eyre-Walker 2011)
+compute_dos <- function(Pn, Ps, Dn, Ds) {
+  div_frac  <- ifelse(!is.na(Dn) & !is.na(Ds) & (Dn + Ds) > 0,
+                      Dn / (Dn + Ds), NA_real_)
+  poly_frac <- ifelse(!is.na(Pn) & !is.na(Ps) & (Pn + Ps) > 0,
+                      Pn / (Pn + Ps), NA_real_)
+  div_frac - poly_frac
+}
+
+# α = 1 − (Ds × Pn) / (Dn × Ps)
+compute_alpha <- function(Pn, Ps, Dn, Ds) {
+  ifelse(!is.na(Dn) & !is.na(Ps) & Dn > 0 & Ps > 0,
+         1 - (Ds * Pn) / (Dn * Ps), NA_real_)
+}
+```
+
+---
+
+## 3  Standard MKT
+
+**Filter** (Stoletzki & Eyre-Walker 2011): Pn + Ps ≥ 5 and Pn, Ps, Dn, Ds ≥ 1.
+
+```{r standard_mkt}
+std <- df %>%
+  mutate(
+    Pn = num_pol_NS,
+    Ps = num_pol_S,
+    Dn = Dn_counts,
+    Ds = Ds_counts,
+    Standard_MKT        = compute_alpha(Pn, Ps, Dn, Ds),
+    DoS_MKT_standard    = compute_dos(Pn, Ps, Dn, Ds),
+    standard_MKT_pvalue = mk_fisher(Pn, Ps, Dn, Ds)
+  )
+
+# Build filter mask with explicit NA handling to avoid subscript-NA errors
+std_mask <- with(std,
+  !is.na(Pn) & Pn >= 1 &
+  !is.na(Ps) & Ps >= 1 &
+  !is.na(Dn) & Dn >= 1 &
+  !is.na(Ds) & Ds >= 1 &
+  (Pn + Ps) >= 5
+)
+
+std <- std %>% mutate(standard_MKT_p_adj = NA_real_)
+if (any(std_mask)) {
+  std$standard_MKT_p_adj[std_mask] <-
+    p.adjust(std$standard_MKT_pvalue[std_mask], method = "BH")
+}
+
+std_filtered <- std %>% filter(std_mask)
+
+cat(sprintf(
+  "Standard MKT: %d / %d genes passed filter (Pn+Ps≥5, all cells≥1)\n",
+  nrow(std_filtered), nrow(df)
+))
+cat(sprintf(
+  "  Positively selected (DoS>0 & raw p<0.05): %d\n",
+  sum(std_filtered$DoS_MKT_standard > 0 & std_filtered$standard_MKT_pvalue < 0.05,
+      na.rm = TRUE)
+))
+```
+
+---
+
+## 4  Imputed MKT (impMKT)
+
+Pn is corrected by subtracting the estimated SDM count (deleterious) before
+applying the test. **Filter**: PnNeutral + Ps ≥ 5 and PnNeutral, Ps, Dn, Ds ≥ 1.
+
+```{r impmkt}
+imp <- std %>%
+  mutate(
+    # Re-cap PnNeutral_estimation to [0, Pn] for safety
+    PnNeutral_safe         = pmax(0, pmin(PnNeutral_estimation, num_pol_NS)),
+    standard_impMKT        = compute_alpha(PnNeutral_safe, Ps, Dn, Ds),
+    DoS_impMKT_standard    = compute_dos(PnNeutral_safe, Ps, Dn, Ds),
+    standard_impMKT_pvalue = mk_fisher(PnNeutral_safe, Ps, Dn, Ds)
+  )
+
+imp_mask <- with(imp,
+  !is.na(PnNeutral_safe) & PnNeutral_safe >= 1 &
+  !is.na(Ps) & Ps >= 1 &
+  !is.na(Dn) & Dn >= 1 &
+  !is.na(Ds) & Ds >= 1 &
+  (PnNeutral_safe + Ps) >= 5
+)
+
+imp <- imp %>% mutate(standard_impMKT_p_adj = NA_real_)
+if (any(imp_mask)) {
+  imp$standard_impMKT_p_adj[imp_mask] <-
+    p.adjust(imp$standard_impMKT_pvalue[imp_mask], method = "BH")
+}
+
+imp_filtered <- imp %>% filter(imp_mask)
+
+cat(sprintf(
+  "impMKT: %d / %d genes passed filter (PnNeutral+Ps≥5, all cells≥1)\n",
+  nrow(imp_filtered), nrow(df)
+))
+cat(sprintf(
+  "  Positively selected (DoS>0 & raw p<0.05): %d\n",
+  sum(imp_filtered$DoS_impMKT_standard > 0 & imp_filtered$standard_impMKT_pvalue < 0.05,
+      na.rm = TRUE)
+))
+```
+
+---
+
+## 5  Final output table
+
+All columns from `merge_tables.py` output plus the 8 MKT statistics columns.
+
+```{r final_table}
+results <- imp %>%
+  select(
+    gene_id,
+    number_sites, num_codons_eff,
+    Pi_per_site, pi_S, pi_NS,
+    thetaW_per_site, Tajimas_D,
+    num_sites_S_egglib, num_sites_NS_egglib,
+    polymorphism_count, num_pol_S, num_pol_NS,
+    sample_size,
+    PnMinus, PnGreater, PsMinus, PsGreater,
+    ratioPs, PnNeutral_estimation,
+    PnNeutral          = round(PnNeutral_safe),
+    deleterious,
+    Dn_counts, Ds_counts,
+    Standard_MKT,        standard_impMKT,
+    DoS_MKT_standard,    standard_MKT_pvalue,    standard_MKT_p_adj,
+    DoS_impMKT_standard, standard_impMKT_pvalue, standard_impMKT_p_adj
+  )
+
+write_tsv(results, params$output_table, na = "NA")
+cat(sprintf("Written: %s  (%d genes, %d columns)\n",
+            params$output_table, nrow(results), ncol(results)))
+```
+
+---
+
+## 6  Summary statistics
+
+```{r summary_stats}
+bind_rows(
+  std_filtered %>% summarise(
+    Test             = "Standard MKT",
+    n_genes_tested   = n(),
+    n_DoS_positive   = sum(DoS_MKT_standard   > 0,  na.rm = TRUE),
+    n_sig_p05        = sum(standard_MKT_pvalue < 0.05, na.rm = TRUE),
+    n_pos_selected   = sum(DoS_MKT_standard    > 0 & standard_MKT_pvalue < 0.05, na.rm = TRUE),
+    pct_pos_selected = round(100 * n_pos_selected / n_genes_tested, 1),
+    median_DoS       = round(median(DoS_MKT_standard, na.rm = TRUE), 4),
+    median_alpha     = round(median(Standard_MKT,      na.rm = TRUE), 4)
+  ),
+  imp_filtered %>% summarise(
+    Test             = "impMKT",
+    n_genes_tested   = n(),
+    n_DoS_positive   = sum(DoS_impMKT_standard   > 0,  na.rm = TRUE),
+    n_sig_p05        = sum(standard_impMKT_pvalue < 0.05, na.rm = TRUE),
+    n_pos_selected   = sum(DoS_impMKT_standard    > 0 & standard_impMKT_pvalue < 0.05, na.rm = TRUE),
+    pct_pos_selected = round(100 * n_pos_selected / n_genes_tested, 1),
+    median_DoS       = round(median(DoS_impMKT_standard, na.rm = TRUE), 4),
+    median_alpha     = round(median(standard_impMKT,      na.rm = TRUE), 4)
+  )
+) %>%
+  kbl(caption = sprintf("MKT summary — %s", params$species)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+---
+
+## 7  Visualisations
+
+```{r colours, include=FALSE}
+CLR_STD  <- "#4C72B0"   # standard MKT (blue)
+CLR_IMP  <- "#DD8452"   # imputed MKT (orange)
+CLR_POS  <- "#C44E52"   # positive selection (red)
+CLR_NEG  <- "#55A868"   # negative selection (green)
+CLR_NTRL <- "#8C8C8C"   # not significant (grey)
+
+theme_pub <- theme_classic(base_size = 11) +
+  theme(
+    plot.title    = element_text(size = 11, face = "bold"),
+    plot.subtitle = element_text(size = 9,  colour = "grey40"),
+    strip.text    = element_text(size = 10, face = "bold"),
+    axis.title    = element_text(size = 10)
+  )
+theme_set(theme_pub)
+```
+
+### 7.1  Alignment statistics
+
+Distribution of alignment length and sample size across genes.
+
+```{r plot_alignment, fig.width=10, fig.height=4, fig.cap="Left: distribution of effective nucleotide sites per gene (number_sites). Right: distribution of the number of alleles analysed per gene (sample_size). Dashed line = median."}
+p_len <- ggplot(df, aes(x = number_sites)) +
+  geom_histogram(bins = 40, fill = CLR_STD, colour = "white") +
+  geom_vline(xintercept = median(df$number_sites, na.rm = TRUE),
+             linetype = "dashed", colour = "grey30") +
+  labs(title = "Alignment length",
+       subtitle = sprintf("median = %d nt", round(median(df$number_sites, na.rm = TRUE))),
+       x = "Effective nucleotide sites", y = "Genes")
+
+p_ss <- ggplot(df, aes(x = sample_size)) +
+  geom_histogram(bins = 30, fill = CLR_STD, colour = "white") +
+  geom_vline(xintercept = median(df$sample_size, na.rm = TRUE),
+             linetype = "dashed", colour = "grey30") +
+  labs(title = "Sample size",
+       subtitle = sprintf("median = %d alleles", round(median(df$sample_size, na.rm = TRUE))),
+       x = "Number of alleles", y = "Genes")
+
+p_len + p_ss
+```
+
+### 7.2  Polymorphism statistics
+
+```{r plot_pi, fig.width=12, fig.height=9, fig.cap="Population-genetics statistics. Top row: nucleotide diversity (pi) and Watterson theta per site. Bottom row: Tajima's D and synonymous vs non-synonymous diversity."}
+p_pi <- ggplot(df, aes(x = Pi_per_site)) +
+  geom_histogram(bins = 40, fill = CLR_STD, colour = "white") +
+  geom_vline(xintercept = median(df$Pi_per_site, na.rm = TRUE),
+             linetype = "dashed", colour = "grey30") +
+  labs(title = expression(paste("Nucleotide diversity ", pi, " per site")),
+       x = "Pi_per_site", y = "Genes")
+
+p_tw <- ggplot(df, aes(x = thetaW_per_site)) +
+  geom_histogram(bins = 40, fill = CLR_STD, colour = "white") +
+  labs(title = expression(paste("Watterson's ", theta, " per site")),
+       x = "thetaW_per_site", y = "Genes")
+
+p_td <- ggplot(df, aes(x = Tajimas_D)) +
+  geom_histogram(bins = 40, fill = CLR_STD, colour = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey30") +
+  labs(title = "Tajima's D", x = "Tajimas_D", y = "Genes")
+
+p_piSNS <- df %>%
+  filter(!is.na(pi_S) & !is.na(pi_NS)) %>%
+  ggplot(aes(x = pi_S, y = pi_NS)) +
+  geom_point(alpha = 0.3, size = 1, colour = CLR_STD) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey30") +
+  labs(title = expression(paste(pi[NS], " vs ", pi[S])),
+       subtitle = "Points above diagonal: excess NS diversity",
+       x = expression(pi[S]), y = expression(pi[NS]))
+
+(p_pi + p_tw) / (p_td + p_piSNS)
+```
+
+### 7.3  Polymorphism and divergence count distributions
+
+```{r plot_counts, fig.width=12, fig.height=8, fig.cap="Distributions of synonymous (Ps) and non-synonymous (Pn) polymorphism counts (top row), and synonymous (Ds) and non-synonymous (Dn) divergence counts (bottom row) per gene."}
+p_Ps <- ggplot(df, aes(x = num_pol_S)) +
+  geom_histogram(bins = 30, fill = CLR_STD, colour = "white") +
+  labs(title = "Synonymous polymorphisms (Ps)",
+       x = "num_pol_S", y = "Genes")
+
+p_Pn <- ggplot(df, aes(x = num_pol_NS)) +
+  geom_histogram(bins = 30, fill = CLR_STD, colour = "white") +
+  labs(title = "Non-synonymous polymorphisms (Pn)",
+       x = "num_pol_NS", y = "Genes")
+
+p_Ds <- ggplot(df %>% filter(!is.na(Ds_counts)), aes(x = Ds_counts)) +
+  geom_histogram(bins = 30, fill = CLR_IMP, colour = "white") +
+  labs(title = "Synonymous divergence (Ds)",
+       x = "Ds_counts", y = "Genes")
+
+p_Dn <- ggplot(df %>% filter(!is.na(Dn_counts)), aes(x = Dn_counts)) +
+  geom_histogram(bins = 30, fill = CLR_IMP, colour = "white") +
+  labs(title = "Non-synonymous divergence (Dn)",
+       x = "Dn_counts", y = "Genes")
+
+(p_Ps + p_Pn) / (p_Ds + p_Dn)
+```
+
+### 7.4  Polymorphism vs divergence scatter plots
+
+```{r plot_scatter, fig.width=10, fig.height=4, fig.cap="Pn vs Ps per gene (left) and Dn vs Ds per gene (right). Dashed line = 1:1 ratio. Points above the diagonal have more NS than S counts."}
+p_PnPs <- ggplot(df, aes(x = num_pol_S, y = num_pol_NS)) +
+  geom_point(alpha = 0.25, size = 1, colour = CLR_STD) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey30") +
+  labs(title = "Polymorphisms: Pn vs Ps",
+       x = "Ps (num_pol_S)", y = "Pn (num_pol_NS)")
+
+p_DnDs <- df %>%
+  filter(!is.na(Dn_counts) & !is.na(Ds_counts)) %>%
+  ggplot(aes(x = Ds_counts, y = Dn_counts)) +
+  geom_point(alpha = 0.25, size = 1, colour = CLR_IMP) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey30") +
+  labs(title = "Divergence: Dn vs Ds",
+       x = "Ds (Ds_counts)", y = "Dn (Dn_counts)")
+
+p_PnPs + p_DnDs
+```
+
+### 7.5  SDM estimation quality
+
+```{r plot_sdm, fig.width=12, fig.height=9, fig.cap="SDM estimation diagnostics. Top-left: distribution of the neutral ratio ratioPs = Pn(>15%)/Ps(>15%). Dashed line at 1 = equal Pn/Ps. Top-right: distribution of the estimated SDM count (deleterious). Dashed line at 0. Bottom-left: corrected PnNeutral vs original Pn; points below the diagonal had SDMs removed. Bottom-right: fraction of Pn attributed to SDMs."}
+p_ratio <- df %>%
+  filter(!is.na(ratioPs) & is.finite(ratioPs)) %>%
+  ggplot(aes(x = ratioPs)) +
+  geom_histogram(bins = 40, fill = CLR_STD, colour = "white") +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey30") +
+  labs(title = "Neutral ratio (ratioPs)",
+       subtitle = expression(paste("P"[N]^{"(>15%)"}, " / P"[S]^{"(>15%)"})),
+       x = "ratioPs", y = "Genes")
+
+p_del <- df %>%
+  filter(!is.na(deleterious)) %>%
+  ggplot(aes(x = deleterious)) +
+  geom_histogram(bins = 40, fill = CLR_STD, colour = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey30") +
+  labs(title = "Estimated SDMs",
+       subtitle = expression(paste("P"[SDM], " = P"[N]^{"(<15%)"},
+                                   " − ratioPs × P"[S]^{"(<15%)"})),
+       x = "deleterious", y = "Genes")
+
+p_pnneut <- imp %>%
+  filter(!is.na(num_pol_NS) & !is.na(PnNeutral_safe)) %>%
+  ggplot(aes(x = num_pol_NS, y = PnNeutral_safe)) +
+  geom_point(alpha = 0.25, size = 1, colour = CLR_STD) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey30") +
+  labs(title = "PnNeutral vs Pn",
+       subtitle = "Below diagonal = SDMs removed from Pn",
+       x = "Pn (num_pol_NS)", y = "PnNeutral")
+
+p_frac <- imp %>%
+  filter(!is.na(num_pol_NS) & num_pol_NS > 0 & !is.na(deleterious)) %>%
+  mutate(frac_del = pmax(0, deleterious) / num_pol_NS) %>%
+  ggplot(aes(x = frac_del)) +
+  geom_histogram(bins = 40, fill = CLR_STD, colour = "white") +
+  labs(title = "Fraction of Pn attributed to SDMs",
+       subtitle = "max(0, deleterious) / Pn",
+       x = "Fraction SDM", y = "Genes")
+
+(p_ratio + p_del) / (p_pnneut + p_frac)
+```
+
+### 7.6  MKT filter summary
+
+```{r plot_filter, fig.width=7, fig.height=4, fig.cap="Number of genes at each analysis stage."}
+filter_df <- tibble(
+  Stage = factor(
+    c("All genes",
+      "Standard MKT\n(Pn+Ps≥5, cells≥1)",
+      "impMKT\n(PnNeutral+Ps≥5, cells≥1)"),
+    levels = c("All genes",
+               "Standard MKT\n(Pn+Ps≥5, cells≥1)",
+               "impMKT\n(PnNeutral+Ps≥5, cells≥1)")
+  ),
+  n = c(nrow(df), nrow(std_filtered), nrow(imp_filtered))
+)
+
+ggplot(filter_df, aes(x = Stage, y = n, fill = Stage)) +
+  geom_col(width = 0.6, colour = "white") +
+  geom_text(aes(label = n), vjust = -0.4, size = 3.5) +
+  scale_fill_manual(values = c("grey70", CLR_STD, CLR_IMP)) +
+  labs(title = "Genes passing MKT filters",
+       x = NULL, y = "Number of genes") +
+  expand_limits(y = max(filter_df$n) * 1.12) +
+  theme(legend.position = "none")
+```
+
+### 7.7  Direction of Selection (DoS) distributions
+
+```{r plot_dos, fig.width=10, fig.height=4, fig.cap="Distribution of DoS = Dn/(Dn+Ds) − Pn/(Pn+Ps) for genes passing each filter. DoS > 0 indicates positive selection, DoS < 0 indicates purifying selection."}
+bind_rows(
+  std_filtered %>% transmute(DoS = DoS_MKT_standard,    Test = "Standard MKT"),
+  imp_filtered %>% transmute(DoS = DoS_impMKT_standard,  Test = "impMKT")
+) %>%
+  ggplot(aes(x = DoS, fill = Test)) +
+  geom_histogram(binwidth = 0.05, colour = "white", alpha = 0.9) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey30") +
+  facet_wrap(~Test, ncol = 2) +
+  scale_fill_manual(values = c("Standard MKT" = CLR_STD, "impMKT" = CLR_IMP)) +
+  labs(title = "Direction of Selection (DoS)",
+       subtitle = "DoS = Dn/(Dn+Ds) − Pn/(Pn+Ps)",
+       x = "DoS", y = "Genes") +
+  theme(legend.position = "none")
+```
+
+### 7.8  α (proportion of adaptive substitutions)
+
+```{r plot_alpha, fig.width=10, fig.height=4, fig.cap="Distribution of α = 1 − (Ds×Pn)/(Dn×Ps) for genes passing each filter."}
+bind_rows(
+  std_filtered %>% transmute(alpha = Standard_MKT,    Test = "Standard MKT"),
+  imp_filtered %>% transmute(alpha = standard_impMKT, Test = "impMKT")
+) %>%
+  filter(is.finite(alpha)) %>%
+  ggplot(aes(x = alpha, fill = Test)) +
+  geom_histogram(bins = 40, colour = "white", alpha = 0.9) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey30") +
+  facet_wrap(~Test, ncol = 2) +
+  scale_fill_manual(values = c("Standard MKT" = CLR_STD, "impMKT" = CLR_IMP)) +
+  labs(title = expression(paste(alpha, " — proportion of adaptive substitutions")),
+       subtitle = expression(paste(alpha, " = 1 − (Ds×Pn)/(Dn×Ps)")),
+       x = expression(alpha), y = "Genes") +
+  theme(legend.position = "none")
+```
+
+### 7.9  p-value distributions
+
+```{r plot_pval, fig.width=10, fig.height=4, fig.cap="Distribution of Fisher's exact test p-values for genes passing each filter. Enrichment near 0 indicates an excess of positive selection signals."}
+bind_rows(
+  std_filtered %>% transmute(pval = standard_MKT_pvalue,    Test = "Standard MKT"),
+  imp_filtered %>% transmute(pval = standard_impMKT_pvalue, Test = "impMKT")
+) %>%
+  filter(!is.na(pval)) %>%
+  ggplot(aes(x = pval, fill = Test)) +
+  geom_histogram(bins = 20, colour = "white", alpha = 0.9) +
+  geom_vline(xintercept = 0.05, linetype = "dashed", colour = "grey30") +
+  facet_wrap(~Test, ncol = 2) +
+  scale_fill_manual(values = c("Standard MKT" = CLR_STD, "impMKT" = CLR_IMP)) +
+  labs(title = "Fisher's exact test p-value distribution",
+       x = "p-value", y = "Genes") +
+  theme(legend.position = "none")
+```
+
+### 7.10  Volcano plots (DoS vs −log₁₀ p)
+
+```{r plot_volcano, fig.width=12, fig.height=5, fig.cap="Volcano plots. Red: DoS > 0 and p < 0.05 (positive selection). Green: DoS < 0 and p < 0.05 (purifying selection). Grey: not significant. Dashed lines at DoS = 0 and p = 0.05."}
+bind_rows(
+  std_filtered %>% transmute(
+    DoS  = DoS_MKT_standard,
+    pval = standard_MKT_pvalue,
+    Test = "Standard MKT"
+  ),
+  imp_filtered %>% transmute(
+    DoS  = DoS_impMKT_standard,
+    pval = standard_impMKT_pvalue,
+    Test = "impMKT"
+  )
+) %>%
+  filter(!is.na(DoS) & !is.na(pval)) %>%
+  mutate(
+    log10p   = -log10(pval),
+    category = case_when(
+      DoS > 0 & pval < 0.05 ~ "Positive selection",
+      DoS < 0 & pval < 0.05 ~ "Purifying selection",
+      TRUE                  ~ "Not significant"
+    )
+  ) %>%
+  ggplot(aes(x = DoS, y = log10p, colour = category)) +
+  geom_point(alpha = 0.5, size = 1.0) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey40") +
+  geom_vline(xintercept = 0,            linetype = "dashed", colour = "grey40") +
+  facet_wrap(~Test, ncol = 2) +
+  scale_colour_manual(values = c(
+    "Positive selection"  = CLR_POS,
+    "Purifying selection" = CLR_NEG,
+    "Not significant"     = CLR_NTRL
+  )) +
+  labs(title = "Volcano plot — direction of selection",
+       x = "DoS = Dn/(Dn+Ds) − Pn/(Pn+Ps)",
+       y = expression(-log[10](p-value)),
+       colour = NULL) +
+  theme(legend.position = "bottom")
+```
+
+### 7.11  Classic McDonald-Kreitman plot
+
+```{r plot_mk, fig.width=12, fig.height=5, fig.cap="McDonald-Kreitman plot. Points above the 1:1 dashed line have a higher dN/dS than pN/pS (consistent with positive selection). Red = DoS > 0 and p < 0.05."}
+mk_std <- std_filtered %>%
+  filter(Ps > 0 & Ds > 0) %>%
+  transmute(
+    pnps     = Pn / Ps,
+    dnds     = Dn / Ds,
+    selected = DoS_MKT_standard > 0 & standard_MKT_pvalue < 0.05,
+    Test     = "Standard MKT"
+  )
+
+mk_imp <- imp_filtered %>%
+  filter(Ps > 0 & Ds > 0) %>%
+  transmute(
+    pnps     = PnNeutral_safe / Ps,
+    dnds     = Dn / Ds,
+    selected = DoS_impMKT_standard > 0 & standard_impMKT_pvalue < 0.05,
+    Test     = "impMKT"
+  )
+
+bind_rows(mk_std, mk_imp) %>%
+  filter(is.finite(pnps) & is.finite(dnds)) %>%
+  ggplot(aes(x = pnps, y = dnds, colour = selected)) +
+  geom_point(alpha = 0.5, size = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40") +
+  scale_colour_manual(
+    values = c("TRUE" = CLR_POS, "FALSE" = CLR_NTRL),
+    labels = c("TRUE" = "DoS > 0 & p < 0.05", "FALSE" = "Non-significant"),
+    name   = NULL
+  ) +
+  scale_x_log10() + scale_y_log10() +
+  facet_wrap(~Test, ncol = 2) +
+  labs(title = "McDonald-Kreitman plot",
+       x = "Pn / Ps (polymorphism ratio, log scale)",
+       y = "Dn / Ds (divergence ratio, log scale)") +
+  theme(legend.position = "bottom")
+```
+
+---
+
+## Session info
+
+```{r session_info}
+sessionInfo()
+```

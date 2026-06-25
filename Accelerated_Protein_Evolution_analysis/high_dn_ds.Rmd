@@ -1,0 +1,793 @@
+---
+title: "Accelerated Protein Evolution — High dN/dS and Branch-Specific Positive Selection"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    theme: flatly
+    fig_caption: true
+params:
+  # Named list: species_label → output_dir from render_analysis.R
+  # All input files (branch_specific_MKT_results.tsv, candidates_*.tsv) are
+  # read automatically from these directories.
+  species_output_dirs: !r list()
+  # z-score threshold above which a gene is classified as "high dN/dS"
+  z_threshold: 1.5
+  # p-value threshold for the branch model likelihood ratio test (LRT)
+  lrt_p_threshold: 0.05
+  # Directory where output tables are written
+  output_dir: "results/high_dn_ds"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.align = "center", fig.width = 9, fig.height = 6)
+```
+
+```{r libraries}
+library(tidyverse)
+library(ComplexUpset)
+library(kableExtra)
+library(patchwork)
+```
+
+This notebook quantifies the overlap between branch-specific positive selection
+signals (from McDonald-Kreitman tests) and protein sequence evolution
+acceleration signals (high branch-specific dN/dS, branch model LRT).
+
+**Analyses performed:**
+
+1. Per-species high dN/dS identification (z-score on log-scale)
+2. Per-species enrichment of MKT candidates in the high dN/dS category
+3. Per-species branch model likelihood ratio test (LRT) for acceleration
+4. Cross-species lineage-specific dN/dS patterns (when ≥2 species)
+5. Cross-species UpSet plots combining MKT methods and high dN/dS
+
+---
+
+## 1  Load data
+
+```{r params_check}
+if (length(params$species_output_dirs) == 0)
+  stop("params$species_output_dirs is empty. Edit render_high_dn_ds.R and provide ",
+       "at least one species.")
+
+n_species <- length(params$species_output_dirs)
+sp_labels <- names(params$species_output_dirs)
+
+cat(sprintf("Species to analyse: %d\n", n_species))
+for (sp in sp_labels)
+  cat(sprintf("  • %s → %s\n", sp, params$species_output_dirs[[sp]]))
+
+cat(sprintf("\nParameters:\n"))
+cat(sprintf("  z_threshold      = %.2f\n", params$z_threshold))
+cat(sprintf("  lrt_p_threshold  = %.3f\n", params$lrt_p_threshold))
+```
+
+```{r load_species_data}
+# Build file paths from output_dir, then load all species data into named lists.
+# File names match the standardised output of branch_specific_MKT_analysis.Rmd.
+
+load_species_data <- function(sp, out_dir) {
+  files <- list(
+    stats    = file.path(out_dir, "branch_specific_MKT_results.tsv"),
+    cand_all = file.path(out_dir, "candidates_all.tsv"),
+    cand_bs  = file.path(out_dir, "candidates_branch_specific.tsv")
+  )
+  missing <- names(Filter(Negate(file.exists), files))
+  if (length(missing) > 0)
+    stop("Files not found for '", sp, "': ", paste(missing, collapse = ", "),
+         "\nCheck that render_analysis.R was run before this script.")
+
+  list(
+    stats    = read_tsv(files$stats,    col_types = cols(.default = col_double(),
+                                                          gene_id  = col_character(),
+                                                          ortholog = col_character()),
+                        na = c("NA", "NaN", "")),
+    cand_all = read_tsv(files$cand_all, col_types = cols(.default = col_character()),
+                        na = c("NA", "NaN", "")),
+    cand_bs  = read_tsv(files$cand_bs,  col_types = cols(.default = col_character()),
+                        na = c("NA", "NaN", ""))
+  )
+}
+
+species_data <- setNames(
+  mapply(load_species_data, sp_labels, params$species_output_dirs,
+         SIMPLIFY = FALSE),
+  sp_labels
+)
+
+for (sp in sp_labels) {
+  cat(sprintf("\n[%s]\n", sp))
+  cat(sprintf("  Genes in stats table : %d\n", nrow(species_data[[sp]]$stats)))
+  cat(sprintf("  All candidates       : %d\n", nrow(species_data[[sp]]$cand_all)))
+  cat(sprintf("  BS candidates        : %d\n", nrow(species_data[[sp]]$cand_bs)))
+}
+```
+
+---
+
+## 2  Analyzable gene sets
+
+Genes are **analyzable** for a given test when they pass the McDonald-Kreitman
+filter:
+- Pn ≥ 1 AND Ps ≥ 1 AND Dn ≥ 1 AND Ds ≥ 1 AND Pn + Ps ≥ 5
+
+Four filter variants are computed using the Pn/Dn/Ds sources for each test:
+
+| Set | Pn | Dn / Ds |
+|-----|-----|---------|
+| `bs_mkt` | Pn (raw) | Dn\_branch\_specific / Ds\_branch\_specific |
+| `bs_imp_mkt` | PnNeutral | Dn\_branch\_specific / Ds\_branch\_specific |
+| `std_mkt` | Pn (raw) | dn\_counts / ds\_counts |
+| `std_imp_mkt` | PnNeutral | dn\_counts / ds\_counts |
+
+```{r analyzable_sets}
+mk_filter <- function(Pn, Ps, Dn, Ds) {
+  !is.na(Pn) & Pn >= 1 & !is.na(Ps) & Ps >= 1 &
+  !is.na(Dn) & Dn >= 1 & !is.na(Ds) & Ds >= 1 &
+  (Pn + Ps) >= 5
+}
+
+get_analyzable <- function(stats_df) {
+  list(
+    bs_mkt = stats_df %>%
+      filter(mk_filter(num_pol_NS, num_pol_S,
+                       Dn_branch_specific, Ds_branch_specific)) %>%
+      pull(gene_id),
+    bs_imp_mkt = stats_df %>%
+      filter(mk_filter(PnNeutral, num_pol_S,
+                       Dn_branch_specific, Ds_branch_specific)) %>%
+      pull(gene_id),
+    std_mkt = stats_df %>%
+      filter(mk_filter(num_pol_NS, num_pol_S, dn_counts, ds_counts)) %>%
+      pull(gene_id),
+    std_imp_mkt = stats_df %>%
+      filter(mk_filter(PnNeutral, num_pol_S, dn_counts, ds_counts)) %>%
+      pull(gene_id)
+  )
+}
+
+analyzable <- lapply(sp_labels, function(sp)
+  get_analyzable(species_data[[sp]]$stats)
+)
+names(analyzable) <- sp_labels
+
+# Summary table
+az_tbl <- bind_rows(lapply(sp_labels, function(sp) {
+  tibble(
+    Species         = sp,
+    bs_mkt          = length(analyzable[[sp]]$bs_mkt),
+    bs_imp_mkt      = length(analyzable[[sp]]$bs_imp_mkt),
+    std_mkt         = length(analyzable[[sp]]$std_mkt),
+    std_imp_mkt     = length(analyzable[[sp]]$std_imp_mkt),
+    total_genes     = nrow(species_data[[sp]]$stats)
+  )
+}))
+
+az_tbl %>%
+  kbl(caption = "Number of genes passing each MKT filter") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+---
+
+## 3  Per-species high dN/dS analysis
+
+### 3.1  dN/dS distributions and z-scores
+
+For each species, the high dN/dS universe consists of genes analyzable in at
+least one branch-specific test (`bs_mkt` OR `bs_imp_mkt`) that have a valid
+`DnDs_branch_specific_counts` value. Z-scores are computed on the
+log₁₊ₓ-transformed values.
+
+```{r compute_dnds_universe}
+compute_dnds_universe <- function(sp) {
+  az_bs  <- union(analyzable[[sp]]$bs_mkt, analyzable[[sp]]$bs_imp_mkt)
+  stats  <- species_data[[sp]]$stats
+
+  stats %>%
+    filter(gene_id %in% az_bs, !is.na(DnDs_branch_specific_counts)) %>%
+    mutate(
+      log_dNdS  = log1p(DnDs_branch_specific_counts),
+      z_dNdS    = as.numeric(scale(log_dNdS)),
+      high_dNdS = z_dNdS > params$z_threshold
+    )
+}
+
+dnds_universe <- lapply(sp_labels, compute_dnds_universe)
+names(dnds_universe) <- sp_labels
+
+for (sp in sp_labels) {
+  u <- dnds_universe[[sp]]
+  cat(sprintf("[%s] dN/dS universe: %d genes  |  high dN/dS (z > %.1f): %d (%.1f%%)\n",
+              sp, nrow(u), params$z_threshold,
+              sum(u$high_dNdS),
+              100 * mean(u$high_dNdS)))
+}
+```
+
+```{r plot_dnds_distributions, fig.cap="Branch-specific dN/dS distributions. Red dashed line: z-score threshold. Candidates (branch-specific positive selection) are highlighted."}
+plots_dist <- lapply(sp_labels, function(sp) {
+  u <- dnds_universe[[sp]]
+  bs_genes <- species_data[[sp]]$cand_bs$gene_id
+
+  u %>%
+    mutate(candidate = gene_id %in% bs_genes) %>%
+    ggplot(aes(x = log_dNdS, fill = candidate, colour = candidate)) +
+    geom_histogram(bins = 40, alpha = 0.7, position = "identity") +
+    geom_vline(
+      xintercept = log1p(quantile(u$DnDs_branch_specific_counts,
+                                   pnorm(params$z_threshold), na.rm = TRUE)),
+      linetype = "dashed", colour = "red"
+    ) +
+    scale_fill_manual(
+      values  = c("TRUE" = "#C44E52", "FALSE" = "#4C72B0"),
+      labels  = c("TRUE" = "BS candidate", "FALSE" = "Background")
+    ) +
+    scale_colour_manual(
+      values  = c("TRUE" = "#C44E52", "FALSE" = "#4C72B0"),
+      guide   = "none"
+    ) +
+    labs(title   = sp,
+         x       = expression(log[1+x](dN/dS[branch])),
+         y       = "Genes",
+         fill    = NULL) +
+    theme_classic(base_size = 11) +
+    theme(legend.position = "bottom")
+})
+
+wrap_plots(plots_dist, ncol = min(2, n_species))
+```
+
+### 3.2  Candidate enrichment in high dN/dS
+
+**Fisher's exact test** (one-sided greater): are branch-specific MKT candidates
+enriched among genes with high dN/dS?
+
+**Wilcoxon rank-sum test**: do candidates have higher dN/dS than background?
+
+```{r enrichment_high_dnds, results='asis'}
+dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+
+enrichment_results <- lapply(sp_labels, function(sp) {
+  u          <- dnds_universe[[sp]]
+  bs_genes   <- intersect(species_data[[sp]]$cand_bs$gene_id, u$gene_id)
+  high_genes <- u$gene_id[u$high_dNdS]
+  bg_genes   <- u$gene_id
+
+  non_cand   <- setdiff(bg_genes, bs_genes)
+
+  # 2×2 contingency table
+  a <- sum(bs_genes  %in% high_genes)
+  b <- sum(bs_genes  %in% setdiff(bg_genes, high_genes))
+  c <- sum(non_cand  %in% high_genes)
+  d <- sum(non_cand  %in% setdiff(bg_genes, high_genes))
+  mat <- matrix(c(a, b, c, d), nrow = 2, byrow = TRUE,
+                dimnames = list(c("BS candidate", "Background"),
+                                c("High dN/dS",  "Not high dN/dS")))
+
+  fisher <- fisher.test(mat, alternative = "greater")
+  wilcox <- wilcox.test(DnDs_branch_specific_counts ~ (gene_id %in% bs_genes),
+                        data = u)
+
+  medians <- u %>%
+    mutate(group = if_else(gene_id %in% bs_genes, "BS candidate", "Background")) %>%
+    group_by(group) %>%
+    summarise(n = n(), median_dNdS = round(median(DnDs_branch_specific_counts), 4))
+
+  list(
+    species   = sp,
+    n_high    = sum(u$high_dNdS),
+    n_cand_bs = length(bs_genes),
+    n_overlap = a,
+    mat       = mat,
+    fisher    = fisher,
+    wilcox    = wilcox,
+    medians   = medians
+  )
+})
+names(enrichment_results) <- sp_labels
+
+# Print results per species
+for (sp in sp_labels) {
+  r <- enrichment_results[[sp]]
+  cat(sprintf("\n### %s\n\n", sp))
+  cat(sprintf("High dN/dS genes (z > %.1f): **%d**  |  ",
+              params$z_threshold, r$n_high))
+  cat(sprintf("BS candidates: **%d**  |  Overlap: **%d**\n\n",
+              r$n_cand_bs, r$n_overlap))
+  print(kbl(r$mat) %>% kable_styling(bootstrap_options = c("striped", "condensed")))
+  cat(sprintf("\nFisher OR = %.3f  p = %.4f\n",
+              r$fisher$estimate, r$fisher$p.value))
+  cat(sprintf("Wilcoxon p = %.4f\n\n", r$wilcox$p.value))
+  print(kbl(r$medians, caption = "Median dN/dS") %>%
+          kable_styling(bootstrap_options = c("striped", "condensed")))
+}
+
+# Write combined enrichment summary
+enrich_tbl <- bind_rows(lapply(sp_labels, function(sp) {
+  r <- enrichment_results[[sp]]
+  tibble(
+    species       = sp,
+    n_universe    = nrow(dnds_universe[[sp]]),
+    n_high_dNdS   = r$n_high,
+    n_candidates  = r$n_cand_bs,
+    n_overlap     = r$n_overlap,
+    fisher_OR     = round(r$fisher$estimate, 4),
+    fisher_pvalue = r$fisher$p.value,
+    wilcox_pvalue = r$wilcox$p.value
+  )
+}))
+
+write_tsv(enrich_tbl, file.path(params$output_dir, "enrichment_high_dNdS.tsv"), na = "NA")
+```
+
+---
+
+## 4  Branch model LRT (acceleration vs deceleration)
+
+Likelihood ratio test comparing the branch model (lineage-specific dN/dS)
+against the M0 model (global dN/dS):
+
+$$LRT = 2 \times (lnL_{branch} - lnL_{M0}) \sim \chi^2_{df=1}$$
+
+A gene is **accelerated** when *p* < `r params$lrt_p_threshold` AND
+omega\_branch > omega\_M0.
+
+```{r branch_model_lrt}
+compute_lrt <- function(sp) {
+  stats <- species_data[[sp]]$stats
+
+  stats %>%
+    filter(!is.na(lnL_branch_model), !is.na(lnL_m0_model),
+           !is.na(omega),            !is.na(omega_m0)) %>%
+    mutate(
+      lrt          = 2 * (lnL_branch_model - lnL_m0_model),
+      lrt_pvalue   = pchisq(lrt, df = 1, lower.tail = FALSE),
+      significant  = lrt_pvalue < params$lrt_p_threshold,
+      acceleration = omega > omega_m0,
+      lrt_category = case_when(
+        significant & acceleration  ~ "Accelerated",
+        significant & !acceleration ~ "Decelerated",
+        TRUE                        ~ "Neutral"
+      )
+    )
+}
+
+lrt_data <- lapply(sp_labels, compute_lrt)
+names(lrt_data) <- sp_labels
+
+# Summary per species
+lrt_summary <- bind_rows(lapply(sp_labels, function(sp) {
+  lrt_data[[sp]] %>%
+    count(lrt_category, name = "n") %>%
+    mutate(
+      species = sp,
+      pct     = round(100 * n / sum(n), 1)
+    ) %>%
+    select(species, lrt_category, n, pct)
+}))
+
+lrt_summary %>%
+  kbl(caption = sprintf("Branch model LRT — classification (p < %.3f)",
+                        params$lrt_p_threshold)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+```{r plot_lrt_omega, fig.cap="omega (branch model, focal species) distributions by LRT category."}
+omega_plots <- lapply(sp_labels, function(sp) {
+  lrt_data[[sp]] %>%
+    filter(!is.na(omega), omega < 10) %>%      # cap extreme outliers for display
+    ggplot(aes(x = omega, fill = lrt_category, colour = lrt_category)) +
+    geom_histogram(bins = 40, alpha = 0.7, position = "identity") +
+    geom_vline(xintercept = 1, linetype = "dashed", colour = "grey40") +
+    scale_fill_manual(values = c(
+      Accelerated = "#C44E52", Decelerated = "#4C72B0", Neutral = "#8C8C8C"
+    )) +
+    scale_colour_manual(values = c(
+      Accelerated = "#C44E52", Decelerated = "#4C72B0", Neutral = "#8C8C8C"
+    ), guide = "none") +
+    facet_wrap(~lrt_category, scales = "free_y") +
+    labs(title = sp, x = "omega (focal branch)", y = "Genes", fill = NULL) +
+    theme_classic(base_size = 11) +
+    theme(legend.position = "none")
+})
+
+wrap_plots(omega_plots, ncol = 1)
+```
+
+### 4.1  Candidates enriched in accelerated genes
+
+```{r lrt_enrichment, results='asis'}
+lrt_enrichment <- lapply(sp_labels, function(sp) {
+  lrt_df   <- lrt_data[[sp]]
+  bs_genes <- intersect(species_data[[sp]]$cand_bs$gene_id, lrt_df$gene_id)
+  accel    <- lrt_df$gene_id[lrt_df$lrt_category == "Accelerated"]
+
+  non_cand <- setdiff(lrt_df$gene_id, bs_genes)
+  a <- sum(bs_genes %in% accel)
+  b <- length(bs_genes) - a
+  c <- sum(non_cand  %in% accel)
+  d <- length(non_cand)  - c
+  mat <- matrix(c(a, b, c, d), nrow = 2, byrow = TRUE,
+                dimnames = list(c("BS candidate", "Background"),
+                                c("Accelerated", "Not accelerated")))
+
+  list(mat = mat, fisher = fisher.test(mat, alternative = "greater"))
+})
+names(lrt_enrichment) <- sp_labels
+
+for (sp in sp_labels) {
+  r <- lrt_enrichment[[sp]]
+  cat(sprintf("\n### %s (LRT enrichment)\n\n", sp))
+  print(kbl(r$mat) %>% kable_styling(bootstrap_options = c("striped", "condensed")))
+  cat(sprintf("\nFisher OR = %.3f  p = %.4f\n\n", r$fisher$estimate, r$fisher$p.value))
+}
+
+# Write LRT classifications and summary
+lrt_tbl <- bind_rows(lapply(sp_labels, function(sp) {
+  lrt_data[[sp]] %>%
+    select(gene_id, ortholog, omega, omega_m0, omega_diff,
+           lnL_branch_model, lnL_m0_model, lrt, lrt_pvalue, lrt_category) %>%
+    mutate(species = sp)
+}))
+
+write_tsv(lrt_tbl, file.path(params$output_dir, "lrt_classifications.tsv"), na = "NA")
+
+lrt_enrich_tbl <- bind_rows(lapply(sp_labels, function(sp) {
+  r <- lrt_enrichment[[sp]]
+  tibble(
+    species       = sp,
+    n_accelerated = r$mat["BS candidate", "Accelerated"] + r$mat["Background", "Accelerated"],
+    n_candidates  = sum(r$mat["BS candidate", ]),
+    n_overlap     = r$mat["BS candidate", "Accelerated"],
+    fisher_OR     = round(r$fisher$estimate, 4),
+    fisher_pvalue = r$fisher$p.value
+  )
+}))
+
+write_tsv(lrt_enrich_tbl, file.path(params$output_dir, "enrichment_lrt_acceleration.tsv"), na = "NA")
+```
+
+### 4.2  Triple overlap: high dN/dS ∩ accelerated ∩ BS candidates
+
+```{r triple_overlap, results='asis'}
+for (sp in sp_labels) {
+  high_genes <- dnds_universe[[sp]]$gene_id[dnds_universe[[sp]]$high_dNdS]
+  accel      <- lrt_data[[sp]]$gene_id[lrt_data[[sp]]$lrt_category == "Accelerated"]
+  bs_cands   <- species_data[[sp]]$cand_bs$gene_id
+
+  triple <- Reduce(intersect, list(high_genes, accel, bs_cands))
+
+  cat(sprintf("\n### %s\n\n", sp))
+  cat(sprintf("High dN/dS: %d  |  Accelerated: %d  |  BS candidates: %d\n",
+              length(high_genes), length(accel), length(bs_cands)))
+  cat(sprintf("High dN/dS ∩ Accelerated       : %d\n", length(intersect(high_genes, accel))))
+  cat(sprintf("High dN/dS ∩ BS candidates     : %d\n", length(intersect(high_genes, bs_cands))))
+  cat(sprintf("Accelerated ∩ BS candidates    : %d\n", length(intersect(accel, bs_cands))))
+  cat(sprintf("**Triple overlap**             : **%d**\n\n", length(triple)))
+
+  if (length(triple) > 0) {
+    trip_df <- species_data[[sp]]$stats %>%
+      filter(gene_id %in% triple) %>%
+      select(gene_id, ortholog, DnDs_branch_specific_counts, omega, lrt_pvalue = any_of("lrt_pvalue")) %>%
+      left_join(select(lrt_data[[sp]], gene_id, lrt_pvalue), by = "gene_id")
+    cat("Genes in triple overlap:\n\n")
+    print(kbl(trip_df) %>% kable_styling(bootstrap_options = c("striped", "condensed")))
+  }
+}
+```
+
+---
+
+```{r cross_species_check, include=FALSE}
+# Set flag used in all subsequent sections
+run_cross_species <- n_species >= 2
+```
+
+## 5  Cross-species analysis
+
+```{r cross_species_skip, results='asis', eval=!run_cross_species}
+cat("> *Cross-species analysis requires ≥2 species in `params$species_output_dirs`.",
+    "Currently only 1 species is provided — this section is skipped.*")
+```
+
+### 5.1  Ortholog pairs and lineage-specific dN/dS patterns
+
+For each pair of focal species, ortholog pairs are identified using the
+`{other_species}_ortholog` columns present in each stats table. The universe
+is restricted to gene pairs analyzable in the branch-specific test in BOTH
+species.
+
+```{r cross_species_pairs, eval=run_cross_species}
+# For each ordered pair (A, B), derive the column name pointing from A to B.
+# The stats table of species A contains a column "{short(B)}_ortholog"
+# where short(B) = last word of B (e.g. "mutica" from "Aegilopsmutica").
+short_name <- function(sp) tolower(sub(".*_", "", sp))
+
+# Find the ortholog-column name in sp_A that points to sp_B genes
+find_ortho_col <- function(sp_a, stats_a, sp_b) {
+  candidates <- paste0(short_name(sp_b), "_ortholog")
+  found <- intersect(candidates, colnames(stats_a))
+  if (length(found) == 0)
+    warning("No ortholog column for '", sp_b, "' found in '", sp_a, "' stats table.")
+  found[1]
+}
+
+# Build dN/dS universe with z-scores for each species
+dnds_z <- lapply(sp_labels, function(sp) {
+  dnds_universe[[sp]] %>%
+    transmute(gene_id, z_dNdS, high_dNdS, dNdS = DnDs_branch_specific_counts)
+})
+names(dnds_z) <- sp_labels
+
+# Build ortholog pairs for all unique pairs of focal species
+all_pairs <- combn(sp_labels, 2, simplify = FALSE)
+
+pair_dfs <- lapply(all_pairs, function(pair) {
+  sp_a <- pair[1]; sp_b <- pair[2]
+  stats_a <- species_data[[sp_a]]$stats
+
+  ortho_col <- find_ortho_col(sp_a, stats_a, sp_b)
+  if (is.na(ortho_col)) return(NULL)
+
+  pairs <- stats_a %>%
+    filter(!is.na(.data[[ortho_col]])) %>%
+    transmute(
+      gene_a    = gene_id,
+      gene_b    = .data[[ortho_col]],
+      ortholog  = ortholog
+    ) %>%
+    filter(gene_a %in% dnds_z[[sp_a]]$gene_id,
+           gene_b %in% dnds_z[[sp_b]]$gene_id) %>%
+    distinct()
+
+  pairs %>%
+    left_join(rename(dnds_z[[sp_a]], z_a = z_dNdS, high_a = high_dNdS, dNdS_a = dNdS),
+              by = c("gene_a" = "gene_id")) %>%
+    left_join(rename(dnds_z[[sp_b]], z_b = z_dNdS, high_b = high_dNdS, dNdS_b = dNdS),
+              by = c("gene_b" = "gene_id")) %>%
+    filter(!is.na(z_a), !is.na(z_b)) %>%
+    mutate(
+      a_specific = z_a >  params$z_threshold & z_b < -params$z_threshold,
+      b_specific = z_b >  params$z_threshold & z_a < -params$z_threshold,
+      shared_high = z_a > params$z_threshold & z_b >  params$z_threshold,
+      shared_low  = z_a < -params$z_threshold & z_b < -params$z_threshold,
+      sp_a = sp_a,
+      sp_b = sp_b
+    )
+})
+names(pair_dfs) <- sapply(all_pairs, paste, collapse = "_vs_")
+pair_dfs <- Filter(Negate(is.null), pair_dfs)
+```
+
+```{r cross_species_summary_table, eval=run_cross_species, results='asis'}
+for (pair_name in names(pair_dfs)) {
+  df <- pair_dfs[[pair_name]]
+  sp_a <- df$sp_a[1]; sp_b <- df$sp_b[1]
+  cat(sprintf("\n#### %s vs %s\n\n", sp_a, sp_b))
+  cat(sprintf("Ortholog pairs analysable in both species: **%d**\n\n", nrow(df)))
+
+  tbl <- tibble(
+    Pattern           = c(sprintf("%s-specific high dN/dS", sp_a),
+                           sprintf("%s-specific high dN/dS", sp_b),
+                           "Shared high dN/dS",
+                           "Shared low dN/dS",
+                           "Neither"),
+    n                 = c(sum(df$a_specific), sum(df$b_specific),
+                           sum(df$shared_high), sum(df$shared_low),
+                           sum(!df$a_specific & !df$b_specific &
+                               !df$shared_high & !df$shared_low)),
+    pct               = round(100 * n / nrow(df), 1)
+  )
+  print(kbl(tbl, caption = paste(sp_a, "vs", sp_b)) %>%
+          kable_styling(bootstrap_options = c("striped", "condensed")))
+}
+```
+
+```{r plot_cross_dnds_scatter, eval=run_cross_species, fig.cap="Cross-species dN/dS z-score scatter. Red: lineage-specific high dN/dS; grey: other orthologs."}
+scatter_plots <- lapply(names(pair_dfs), function(pair_name) {
+  df   <- pair_dfs[[pair_name]]
+  sp_a <- df$sp_a[1]; sp_b <- df$sp_b[1]
+
+  df %>%
+    mutate(pattern = case_when(
+      a_specific  ~ paste(sp_a, "specific"),
+      b_specific  ~ paste(sp_b, "specific"),
+      shared_high ~ "Shared high",
+      shared_low  ~ "Shared low",
+      TRUE        ~ "Neutral"
+    )) %>%
+    ggplot(aes(x = z_a, y = z_b, colour = pattern)) +
+    geom_point(alpha = 0.4, size = 0.9) +
+    geom_hline(yintercept = c(-params$z_threshold, params$z_threshold),
+               linetype = "dashed", colour = "grey50") +
+    geom_vline(xintercept = c(-params$z_threshold, params$z_threshold),
+               linetype = "dashed", colour = "grey50") +
+    scale_colour_manual(values = c(
+      setNames("#C44E52", paste(sp_a, "specific")),
+      setNames("#4C72B0", paste(sp_b, "specific")),
+      "Shared high" = "#DD8452",
+      "Shared low"  = "#55A868",
+      "Neutral"     = "#BBBBBB"
+    )) +
+    labs(title  = sprintf("%s vs %s", sp_a, sp_b),
+         x      = sprintf("z(dN/dS) — %s", sp_a),
+         y      = sprintf("z(dN/dS) — %s", sp_b),
+         colour = NULL) +
+    theme_classic(base_size = 11) +
+    theme(legend.position = "bottom")
+})
+
+wrap_plots(scatter_plots, ncol = min(2, length(scatter_plots)))
+```
+
+### 5.2  UpSet plot — MKT methods × species
+
+Each gene pair is annotated with the MKT tests that detected positive selection
+in each species, using the boolean `pos_*` columns from the candidates tables.
+
+```{r upset_methods, eval=run_cross_species, fig.width=10, fig.height=6, fig.cap="UpSet plot: overlap of MKT positive selection signals across species and tests (universe = gene pairs analysable in both species for both standard impMKT and branch-specific impMKT)."}
+# Build upset dataset: one row per analyzable ortholog pair, boolean columns
+# for each (species × test) combination.
+
+build_upset_data <- function(pair_df) {
+  sp_a <- pair_df$sp_a[1]; sp_b <- pair_df$sp_b[1]
+
+  # Analyzable in both std_imp AND bs_imp
+  az_a <- intersect(analyzable[[sp_a]]$std_imp_mkt, analyzable[[sp_a]]$bs_imp_mkt)
+  az_b <- intersect(analyzable[[sp_b]]$std_imp_mkt, analyzable[[sp_b]]$bs_imp_mkt)
+
+  df <- pair_df %>%
+    filter(gene_a %in% az_a, gene_b %in% az_b)
+
+  # Candidates from each species
+  cand_a <- species_data[[sp_a]]$cand_all
+  cand_b <- species_data[[sp_b]]$cand_all
+
+  short_a <- short_name(sp_a); short_b <- short_name(sp_b)
+
+  df %>%
+    mutate(
+      !!paste0(short_a, "_std_impMKT") :=
+        gene_a %in% cand_a$gene_id[cand_a$pos_standard_impMKT == "TRUE"],
+      !!paste0(short_a, "_bs_impMKT") :=
+        gene_a %in% cand_a$gene_id[cand_a$pos_branch_specific_impMKT == "TRUE"],
+      !!paste0(short_b, "_std_impMKT") :=
+        gene_b %in% cand_b$gene_id[cand_b$pos_standard_impMKT == "TRUE"],
+      !!paste0(short_b, "_bs_impMKT") :=
+        gene_b %in% cand_b$gene_id[cand_b$pos_branch_specific_impMKT == "TRUE"]
+    ) %>%
+    mutate(across(matches("_std_impMKT|_bs_impMKT"), ~ replace_na(.x, FALSE)))
+}
+
+for (pair_name in names(pair_dfs)) {
+  df   <- pair_dfs[[pair_name]]
+  sp_a <- df$sp_a[1]; sp_b <- df$sp_b[1]
+  short_a <- short_name(sp_a); short_b <- short_name(sp_b)
+
+  upset_df  <- build_upset_data(df)
+  upset_cols <- grep("_std_impMKT|_bs_impMKT", colnames(upset_df), value = TRUE)
+
+  cat(sprintf("\n#### UpSet: %s vs %s  (%d pairs)\n", sp_a, sp_b, nrow(upset_df)))
+
+  p <- upset(
+    upset_df %>% select(all_of(upset_cols)) %>% as.data.frame(),
+    intersect   = upset_cols,
+    name        = "Method × species",
+    width_ratio = 0.2,
+    min_size    = 1,
+    set_sizes   = upset_set_size()
+  ) + ggtitle(sprintf("Positive selection methods — %s vs %s", sp_a, sp_b))
+  print(p)
+}
+```
+
+### 5.3  UpSet — MKT methods + high dN/dS
+
+Same plot with additional `high dN/dS` sets for each species.
+
+```{r upset_methods_highdnds, eval=run_cross_species, fig.width=12, fig.height=6, fig.cap="UpSet including high dN/dS categories."}
+for (pair_name in names(pair_dfs)) {
+  df   <- pair_dfs[[pair_name]]
+  sp_a <- df$sp_a[1]; sp_b <- df$sp_b[1]
+  short_a <- short_name(sp_a); short_b <- short_name(sp_b)
+
+  upset_df   <- build_upset_data(df) %>%
+    mutate(
+      !!paste0(short_a, "_high_dNdS") := high_a,
+      !!paste0(short_b, "_high_dNdS") := high_b
+    ) %>%
+    mutate(across(matches("_high_dNdS"), ~ replace_na(.x, FALSE)))
+
+  upset_cols <- grep("_std_impMKT|_bs_impMKT|_high_dNdS",
+                     colnames(upset_df), value = TRUE)
+
+  p <- upset(
+    upset_df %>% select(all_of(upset_cols)) %>% as.data.frame(),
+    intersect   = upset_cols,
+    name        = "Method × species",
+    width_ratio = 0.2,
+    min_size    = 1,
+    set_sizes   = upset_set_size()
+  ) + ggtitle(sprintf("MKT methods + high dN/dS — %s vs %s", sp_a, sp_b))
+  print(p)
+}
+```
+
+### 5.4  Enrichment of BS candidates in lineage-specific patterns
+
+Fisher's exact test (one-sided greater): are branch-specific impMKT candidates
+enriched among genes with lineage-specific high dN/dS?
+
+```{r lineage_enrichment, eval=run_cross_species, results='asis'}
+lineage_enrich <- lapply(names(pair_dfs), function(pair_name) {
+  df   <- pair_dfs[[pair_name]]
+  sp_a <- df$sp_a[1]; sp_b <- df$sp_b[1]
+
+  run_fisher_lineage <- function(cand_genes, lineage_mask, universe) {
+    cand  <- intersect(cand_genes, universe)
+    bg    <- setdiff(universe, cand)
+    a <- sum(cand %in% lineage_mask); b <- length(cand) - a
+    c <- sum(bg   %in% lineage_mask); d <- length(bg)   - c
+    mat <- matrix(c(a, b, c, d), nrow = 2,
+                  dimnames = list(c("BS candidate", "Background"),
+                                  c("Lineage-specific", "Other")))
+    list(mat = mat, fisher = fisher.test(mat, alternative = "greater"))
+  }
+
+  list(
+    pair = pair_name,
+    sp_a = sp_a, sp_b = sp_b,
+    a_specific = run_fisher_lineage(
+      species_data[[sp_a]]$cand_bs$gene_id,
+      df$gene_a[df$a_specific],
+      df$gene_a
+    ),
+    b_specific = run_fisher_lineage(
+      species_data[[sp_b]]$cand_bs$gene_id,
+      df$gene_b[df$b_specific],
+      df$gene_b
+    )
+  )
+})
+names(lineage_enrich) <- names(pair_dfs)
+
+for (pair_name in names(lineage_enrich)) {
+  r <- lineage_enrich[[pair_name]]
+  cat(sprintf("\n#### %s — lineage-specific enrichment\n\n", pair_name))
+
+  cat(sprintf("**%s-specific high dN/dS** (BS candidates enriched?)\n", r$sp_a))
+  print(kbl(r$a_specific$mat) %>%
+          kable_styling(bootstrap_options = c("striped", "condensed")))
+  cat(sprintf("Fisher OR = %.3f  p = %.4f\n\n",
+              r$a_specific$fisher$estimate, r$a_specific$fisher$p.value))
+
+  cat(sprintf("**%s-specific high dN/dS** (BS candidates enriched?)\n", r$sp_b))
+  print(kbl(r$b_specific$mat) %>%
+          kable_styling(bootstrap_options = c("striped", "condensed")))
+  cat(sprintf("Fisher OR = %.3f  p = %.4f\n\n",
+              r$b_specific$fisher$estimate, r$b_specific$fisher$p.value))
+}
+
+# Write pair-level outputs
+for (pair_name in names(pair_dfs)) {
+  write_tsv(
+    pair_dfs[[pair_name]] %>% select(-sp_a, -sp_b),
+    file.path(params$output_dir, paste0("ortholog_pairs_", pair_name, ".tsv")),
+    na = "NA"
+  )
+}
+```
+
+---
+
+## Session info
+
+```{r session_info}
+sessionInfo()
+```

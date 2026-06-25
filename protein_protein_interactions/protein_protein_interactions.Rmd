@@ -1,0 +1,572 @@
+---
+title: "`r paste0('PPI Network Analysis — ', params$experiment_name)`"
+author: ""
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+    code_folding: hide
+    df_print: paged
+params:
+  experiment_name: "Positive Selection Candidates"
+  # Named list of species configurations (set in render_ppi.R)
+  species_configs: !r list()
+  # STRING combined score threshold for retaining interactions
+  score_threshold: 0.7
+  # Number of permutations for the null distribution
+  n_permutations: 200
+  # niter = ecount(graph) * rewire_multiplier for the rewiring null
+  rewire_multiplier: 10
+  # Random seed for reproducibility
+  seed: 123
+  # Output directory for TSV result tables
+  output_dir: "results/ppi"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  cache     = FALSE,
+  echo      = FALSE,
+  message   = FALSE,
+  warning   = FALSE,
+  fig.align = "center",
+  fig.width  = 10,
+  fig.height = 5
+)
+```
+
+```{r packages, include=FALSE}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(igraph)
+  library(kableExtra)
+  library(patchwork)
+})
+```
+
+```{r helpers, include=FALSE}
+
+# ── Load candidate STRING IDs from a plain-text file (one ID per line) ────────
+load_candidate_ids <- function(f) {
+  ids <- readLines(f)
+  unique(trimws(ids[nzchar(trimws(ids))]))
+}
+
+# ── Load & filter STRING interactions (Cytoscape edge-export CSV) ─────────────
+# Handles the "shared name" format: "4565.XXXXX (pp) 4565.YYYYY"
+load_interactions <- function(edge_file, score_threshold) {
+  raw <- read_csv(edge_file, show_col_types = FALSE)
+
+  if ("shared name" %in% names(raw)) {
+    raw <- raw %>% mutate(
+      node1 = str_extract(`shared name`, "^[^ ]+"),
+      node2 = str_extract(`shared name`, "[^ ]+$")
+    )
+  } else {
+    n1 <- intersect(c("node1", "protein1", "from"), names(raw))[1]
+    n2 <- intersect(c("node2", "protein2", "to"),   names(raw))[1]
+    if (is.na(n1) || is.na(n2))
+      stop("Cannot detect node columns in edge file: ", edge_file)
+    raw <- raw %>% rename(node1 = all_of(n1), node2 = all_of(n2))
+  }
+
+  score_col <- intersect(
+    c("stringdb::score", "combined_score", "score"),
+    names(raw)
+  )[1]
+
+  raw %>%
+    transmute(
+      node1 = as.character(node1),
+      node2 = as.character(node2),
+      score = if (!is.na(score_col)) as.numeric(.data[[score_col]]) else NA_real_
+    ) %>%
+    filter(is.na(score) | score >= score_threshold)
+}
+
+# ── Load node descriptions (Cytoscape STRING node-export CSV) ─────────────────
+# Returns: STRING_ID | short_id (display name) | description
+load_node_info <- function(node_file) {
+  empty <- tibble(STRING_ID = character(), short_id = character(), description = character())
+  if (!file.exists(node_file)) return(empty)
+
+  nd       <- read_csv(node_file, show_col_types = FALSE)
+  id_col   <- intersect(c("name", "stringdb::database identifier"), names(nd))[1]
+  disp_col <- "display name"
+  desc_col <- intersect(c("stringdb::description", "description"), names(nd))[1]
+
+  if (is.na(id_col)) return(empty)
+
+  tibble(
+    STRING_ID   = as.character(nd[[id_col]]),
+    short_id    = if (disp_col %in% names(nd)) as.character(nd[[disp_col]]) else NA_character_,
+    description = if (!is.na(desc_col))          as.character(nd[[desc_col]]) else NA_character_
+  ) %>% distinct()
+}
+
+# ── Gene length proxy from branch_specific_MKT_results.tsv ───────────────────
+# Maps aestivum_ortholog (version-stripped) → STRING ID via the node file.
+# Returns tibble: gene (STRING ID) | length
+load_gene_lengths <- function(output_dir, node_file) {
+  empty    <- tibble(gene = character(), length = numeric())
+  mkt_file <- file.path(output_dir, "branch_specific_MKT_results.tsv")
+  if (!file.exists(mkt_file) || !file.exists(node_file)) return(empty)
+
+  mkt <- read_tsv(mkt_file, show_col_types = FALSE)
+
+  # Prefer explicit site-count columns; fall back to total polymorphism count
+  len_col <- intersect(c("number_sites_S", "number_sites", "L_s"), names(mkt))[1]
+  if (!is.na(len_col)) {
+    mkt <- mkt %>% mutate(.len = as.numeric(.data[[len_col]]))
+  } else if (all(c("num_pol_NS", "num_pol_S") %in% names(mkt))) {
+    mkt <- mkt %>% mutate(.len = num_pol_NS + num_pol_S)
+  } else {
+    return(empty)
+  }
+
+  mkt_clean <- mkt %>%
+    filter(!is.na(aestivum_ortholog), !is.na(.len)) %>%
+    transmute(
+      wheat_id = str_remove(aestivum_ortholog, "\\.[0-9]+$"),
+      length   = .len
+    ) %>%
+    distinct()
+
+  nd <- read_csv(node_file, show_col_types = FALSE)
+  if (!all(c("display name", "name") %in% names(nd))) return(empty)
+
+  nd %>%
+    transmute(wheat_id = `display name`, STRING_ID = name) %>%
+    distinct() %>%
+    inner_join(mkt_clean, by = "wheat_id") %>%
+    transmute(gene = STRING_ID, length = as.numeric(length)) %>%
+    distinct()
+}
+
+# ── Observed candidate subgraph metrics ───────────────────────────────────────
+compute_metrics <- function(edges, pos_set) {
+  k             <- length(pos_set)
+  edges_between <- sum(edges$node1 %in% pos_set & edges$node2 %in% pos_set)
+  possible      <- if (k >= 2) choose(k, 2) else NA_real_
+  density       <- if (!is.na(possible) && possible > 0) edges_between / possible else NA_real_
+  list(edges_between = edges_between, possible_pairs = possible, density = density)
+}
+
+# ── Sampling helpers ──────────────────────────────────────────────────────────
+.sample_degree_matched <- function(all_genes, degree_tbl, pos_set, n_bins = 10) {
+  tbl      <- degree_tbl %>% mutate(bin = ntile(degree, n_bins))
+  pos_bins <- tbl %>% filter(gene %in% pos_set) %>% pull(bin)
+  map_chr(pos_bins, function(b) {
+    pool <- tbl %>% filter(bin == b, !(gene %in% pos_set)) %>% pull(gene)
+    if (!length(pool)) pool <- setdiff(all_genes, pos_set)
+    sample(pool, 1)
+  }) %>% unique()
+}
+
+.sample_degree_length_matched <- function(all_genes, degree_tbl, length_tbl, pos_set,
+                                           n_deg = 10, n_len = 5) {
+  if (is.null(length_tbl) || nrow(length_tbl) == 0)
+    return(.sample_degree_matched(all_genes, degree_tbl, pos_set, n_deg))
+
+  combined <- degree_tbl %>%
+    left_join(length_tbl, by = "gene") %>%
+    mutate(
+      length  = if (all(is.na(length))) degree
+                else replace_na(length, median(length, na.rm = TRUE)),
+      deg_bin = ntile(degree, n_deg),
+      len_bin = ntile(length, n_len),
+      bin     = paste0(deg_bin, "_", len_bin)
+    )
+
+  pos_bins <- combined %>% filter(gene %in% pos_set) %>% pull(bin)
+  map_chr(pos_bins, function(b) {
+    pool <- combined %>% filter(bin == b, !(gene %in% pos_set)) %>% pull(gene)
+    if (!length(pool)) pool <- setdiff(all_genes, pos_set)
+    sample(pool, 1)
+  }) %>% unique()
+}
+
+# ── Permutation test (one method) ────────────────────────────────────────────
+# Returns list: null_dens (numeric vector), p_val (scalar), obs (metrics list)
+run_permutation <- function(edges, all_genes, degree_tbl, pos_set, nperm,
+                             method = c("degree_matched", "degree_length", "rewire", "naive"),
+                             length_tbl = NULL, rewire_mult = 10) {
+  method <- match.arg(method)
+  obs    <- compute_metrics(edges, pos_set)
+  k      <- length(pos_set)
+
+  if (method == "rewire") {
+    g  <- igraph::graph_from_data_frame(
+            edges[, c("node1", "node2")], directed = FALSE,
+            vertices = unique(c(edges$node1, edges$node2))
+          ) %>% igraph::simplify()
+    nd <- numeric(nperm)
+    for (i in seq_len(nperm)) {
+      g_rw <- igraph::rewire(g, igraph::keeping_degseq(niter = igraph::ecount(g) * rewire_mult))
+      e_rw <- igraph::as_data_frame(g_rw, "edges")
+      nd[i] <- compute_metrics(tibble(node1 = e_rw$from, node2 = e_rw$to), pos_set)$density
+    }
+    return(list(null_dens = nd, p_val = mean(nd >= obs$density, na.rm = TRUE), obs = obs))
+  }
+
+  nd <- numeric(nperm)
+  for (i in seq_len(nperm)) {
+    rs <- switch(method,
+      degree_matched = .sample_degree_matched(all_genes, degree_tbl, pos_set),
+      degree_length  = .sample_degree_length_matched(all_genes, degree_tbl, length_tbl, pos_set),
+      naive          = sample(all_genes, k, replace = FALSE)
+    )
+    if (length(rs) < k)
+      rs <- c(rs, sample(setdiff(all_genes, rs), k - length(rs)))
+    nd[i] <- compute_metrics(edges, rs)$density
+  }
+  list(null_dens = nd, p_val = mean(nd >= obs$density, na.rm = TRUE), obs = obs)
+}
+
+# ── Jackknife: leave-one-candidate-out ────────────────────────────────────────
+jackknife_influence <- function(edges, pos_set, node_info, n_max = 30) {
+  if (length(pos_set) <= 1)
+    return(tibble(STRING_ID = character(), short_id = character(),
+                  description = character(), density_without = numeric(), delta = numeric()))
+
+  base       <- compute_metrics(edges, pos_set)$density
+  candidates <- if (length(pos_set) > n_max) sample(pos_set, n_max) else pos_set
+
+  bind_rows(map(candidates, function(g) {
+    d <- compute_metrics(edges, setdiff(pos_set, g))$density
+    tibble(STRING_ID = g, density_without = d, delta = base - d)
+  })) %>%
+    left_join(node_info %>% select(STRING_ID, short_id, description), by = "STRING_ID") %>%
+    arrange(desc(delta))
+}
+
+# ── 4-panel permutation plot (patchwork) ─────────────────────────────────────
+plot_permutations <- function(perm_list, obs_density, sp_label) {
+  cols <- c(degree_matched = "steelblue3", degree_length = "forestgreen",
+             rewired = "purple4",           naive = "grey50")
+  lbls <- c(degree_matched = "Degree-matched",   degree_length = "Degree + length",
+             rewired = "Network rewiring",         naive = "Naive")
+
+  plots <- imap(perm_list, function(res, method) {
+    tibble(x = res$null_dens) %>%
+      ggplot(aes(x = x)) +
+      geom_histogram(bins = 30, fill = cols[[method]], colour = "white", alpha = 0.85) +
+      geom_vline(xintercept = obs_density, colour = "firebrick",
+                 linetype = "dashed", linewidth = 1) +
+      annotate("text", x = obs_density, y = Inf,
+               label = sprintf(" obs = %.4f", obs_density),
+               hjust = 0, vjust = 1.4, size = 3, colour = "firebrick") +
+      labs(
+        title    = lbls[[method]],
+        subtitle = sprintf("p = %.3f", res$p_val),
+        x        = "Null subgraph density",
+        y        = "Count"
+      ) +
+      theme_minimal(base_size = 10) +
+      theme(plot.title    = element_text(face = "bold"),
+            plot.subtitle = element_text(colour = "grey40"))
+  })
+
+  wrap_plots(plots, ncol = 2) +
+    plot_annotation(
+      title = sprintf("%s  |  Candidate subgraph density (obs = %.4f)", sp_label, obs_density),
+      theme = theme(plot.title = element_text(size = 12, face = "bold"))
+    )
+}
+```
+
+---
+
+# `r params$experiment_name`
+
+**STRING score threshold:** `r params$score_threshold`
+| **Permutations:** `r params$n_permutations`
+| **Candidate type:** branch-specific MKT (from input `.txt` files)
+| **Output:** `r params$output_dir`
+
+---
+
+## Per-species analysis
+
+```{r per-species, results='asis', fig.show='asis', fig.width=10, fig.height=5}
+set.seed(params$seed)
+dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+
+all_network_summaries <- list()
+
+for (.sp in names(params$species_configs)) {
+  .cfg <- params$species_configs[[.sp]]
+
+  cat(sprintf("\n\n### %s\n\n", .cfg$label))
+
+  # ── 1. Load inputs ───────────────────────────────────────────────────────────
+  if (!file.exists(.cfg$candidate_ids_file))
+    stop("Candidate IDs file not found: ", .cfg$candidate_ids_file)
+  if (!file.exists(.cfg$network_edge_file))
+    stop("Network edge file not found: ", .cfg$network_edge_file)
+
+  .pos_ids  <- load_candidate_ids(.cfg$candidate_ids_file)
+  .edges    <- load_interactions(.cfg$network_edge_file, params$score_threshold)
+  .node_inf <- load_node_info(.cfg$network_node_file)
+  .lengths  <- load_gene_lengths(.cfg$output_dir, .cfg$network_node_file)
+
+  # ── 2. Gene sets ─────────────────────────────────────────────────────────────
+  .all_ids      <- unique(c(.edges$node1, .edges$node2))
+  .pos_in_net   <- intersect(.pos_ids, .all_ids)
+  .n_pos        <- length(.pos_in_net)
+  .n_all        <- length(.all_ids)
+
+  cat(sprintf(
+    "- Candidate STRING IDs: **%d** loaded, **%d** present in network\n",
+    length(.pos_ids), .n_pos
+  ))
+  cat(sprintf(
+    "- Network: **%d** nodes, **%d** edges (score ≥ %.1f)\n",
+    .n_all, nrow(.edges), params$score_threshold
+  ))
+  cat(sprintf(
+    "- Gene length data available: **%s** (%d genes mapped)\n\n",
+    if (nrow(.lengths) > 0) "yes" else "no (using degree-only matching)",
+    nrow(.lengths)
+  ))
+
+  if (.n_pos < 2) {
+    cat("*Fewer than 2 candidates present in the network — skipping species.*\n")
+    next
+  }
+
+  # ── 3. Observed metrics ──────────────────────────────────────────────────────
+  .obs <- compute_metrics(.edges, .pos_in_net)
+  cat(sprintf(
+    "**Observed:** %d candidate–candidate edges out of %d possible pairs (density = **%.4f**)\n\n",
+    .obs$edges_between, .obs$possible_pairs, .obs$density
+  ))
+
+  # ── 4. Degree distribution ───────────────────────────────────────────────────
+  .degree_tbl <- bind_rows(
+    .edges %>% transmute(gene = node1),
+    .edges %>% transmute(gene = node2)
+  ) %>%
+    count(gene, name = "degree")
+
+  .w_test <- wilcox.test(
+    .degree_tbl$degree[.degree_tbl$gene %in% .pos_in_net],
+    .degree_tbl$degree[!(.degree_tbl$gene %in% .pos_in_net)]
+  )
+
+  .deg_plot <- .degree_tbl %>%
+    mutate(category = if_else(gene %in% .pos_in_net, "Candidate", "Neutral")) %>%
+    ggplot(aes(x = degree, fill = category)) +
+    geom_density(alpha = 0.6, adjust = 1.2) +
+    scale_fill_manual(values = c(Candidate = "firebrick3", Neutral = "steelblue3")) +
+    scale_x_log10() +
+    labs(
+      title    = sprintf("%s — Degree distribution (log scale)", .cfg$label),
+      subtitle = sprintf("Wilcoxon W = %.0f, p = %.4f", .w_test$statistic, .w_test$p.value),
+      x        = "Degree (log10)",
+      y        = "Density",
+      fill     = NULL
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(legend.position = "top",
+          plot.title    = element_text(face = "bold"),
+          plot.subtitle = element_text(colour = "grey40"))
+
+  print(.deg_plot)
+  cat("\n\n")
+
+  # ── 5. Permutation tests ─────────────────────────────────────────────────────
+  .perm_dm    <- run_permutation(.edges, .all_ids, .degree_tbl, .pos_in_net,
+                                  params$n_permutations, "degree_matched")
+  .perm_dl    <- run_permutation(.edges, .all_ids, .degree_tbl, .pos_in_net,
+                                  params$n_permutations, "degree_length",
+                                  length_tbl = .lengths)
+  .perm_rew   <- run_permutation(.edges, .all_ids, .degree_tbl, .pos_in_net,
+                                  params$n_permutations, "rewire",
+                                  rewire_mult = params$rewire_multiplier)
+  .perm_naive <- run_permutation(.edges, .all_ids, .degree_tbl, .pos_in_net,
+                                  params$n_permutations, "naive")
+
+  print(
+    plot_permutations(
+      list(degree_matched = .perm_dm, degree_length = .perm_dl,
+           rewired = .perm_rew,       naive = .perm_naive),
+      obs_density = .obs$density,
+      sp_label    = .cfg$label
+    )
+  )
+  cat("\n\n")
+
+  # ── 6. P-value summary table ─────────────────────────────────────────────────
+  .pval_tbl <- tibble(
+    Method      = c("Degree-matched", "Degree + length", "Network rewiring", "Naive"),
+    Null_type   = c("Permutation", "Permutation", "Degree-sequence preserving rewiring", "Permutation"),
+    p_value     = c(.perm_dm$p_val, .perm_dl$p_val, .perm_rew$p_val, .perm_naive$p_val),
+    Significant = if_else(c(.perm_dm$p_val, .perm_dl$p_val, .perm_rew$p_val, .perm_naive$p_val) < 0.05,
+                           "yes", "no")
+  )
+
+  print(
+    kable(.pval_tbl, digits = 3,
+          caption = sprintf("%s — Permutation test p-values (obs density = %.4f)",
+                            .cfg$label, .obs$density)) %>%
+      kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE) %>%
+      row_spec(which(.pval_tbl$p_value < 0.05), bold = TRUE)
+  )
+  cat("\n\n")
+
+  # ── 7. Jackknife influence ───────────────────────────────────────────────────
+  cat("#### Jackknife influence (top candidates by subgraph density contribution)\n\n")
+  .jk <- jackknife_influence(.edges, .pos_in_net, .node_inf)
+  if (nrow(.jk) > 0) {
+    print(
+      kable(head(.jk, 15), digits = 4,
+            caption = sprintf("%s — Leave-one-out influence on subgraph density", .cfg$label)) %>%
+        kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+    )
+    cat("\n\n")
+  }
+
+  # ── 8. Candidate–candidate interaction table ──────────────────────────────────
+  cat("#### Candidate–candidate interactions\n\n")
+  .cc_pairs <- .edges %>%
+    filter(node1 %in% .pos_in_net & node2 %in% .pos_in_net) %>%
+    left_join(.node_inf %>% select(STRING_ID, short_id, description),
+              by = c("node1" = "STRING_ID")) %>%
+    rename(id1 = short_id, desc1 = description) %>%
+    left_join(.node_inf %>% select(STRING_ID, short_id, description),
+              by = c("node2" = "STRING_ID")) %>%
+    rename(id2 = short_id, desc2 = description) %>%
+    transmute(
+      Protein_1    = if_else(!is.na(id1), id1, node1),
+      Protein_2    = if_else(!is.na(id2), id2, node2),
+      Score        = score,
+      Function_1   = str_trunc(desc1, 60),
+      Function_2   = str_trunc(desc2, 60),
+      species      = .cfg$label
+    ) %>%
+    arrange(desc(Score))
+
+  if (nrow(.cc_pairs) > 0) {
+    print(
+      kable(head(.cc_pairs %>% select(-species), 20), digits = 3,
+            caption = sprintf("%s — Top candidate–candidate interactions (n = %d total)",
+                              .cfg$label, nrow(.cc_pairs))) %>%
+        kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+    )
+  } else {
+    cat("*No candidate–candidate interactions detected above the score threshold.*\n")
+  }
+  cat("\n\n")
+
+  # ── 9. Per-candidate connectivity summary ─────────────────────────────────────
+  cat("#### Per-candidate connectivity\n\n")
+  .connectivity <- bind_rows(
+    .edges %>% transmute(src = node1, tgt = node2),
+    .edges %>% transmute(src = node2, tgt = node1)
+  ) %>%
+    filter(src %in% .pos_in_net) %>%
+    mutate(partner_type = if_else(tgt %in% .pos_in_net, "candidate", "neutral")) %>%
+    group_by(src) %>%
+    summarise(
+      total_degree       = n_distinct(tgt),
+      candidate_partners = n_distinct(tgt[partner_type == "candidate"]),
+      neutral_partners   = n_distinct(tgt[partner_type == "neutral"]),
+      .groups            = "drop"
+    ) %>%
+    left_join(.node_inf %>% select(STRING_ID, short_id, description),
+              by = c("src" = "STRING_ID")) %>%
+    transmute(
+      Protein          = if_else(!is.na(short_id), short_id, src),
+      STRING_ID        = src,
+      Function         = str_trunc(description, 70),
+      Total_degree     = total_degree,
+      Candidate_partners = candidate_partners,
+      Neutral_partners = neutral_partners
+    ) %>%
+    arrange(desc(Candidate_partners), desc(Total_degree))
+
+  print(
+    kable(.connectivity, digits = 0,
+          caption = sprintf("%s — Candidate connectivity summary", .cfg$label)) %>%
+      kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE) %>%
+      column_spec(5, bold = TRUE)
+  )
+  cat("\n\n")
+
+  # ── 10. Save TSVs ────────────────────────────────────────────────────────────
+  .safe_sp <- gsub("[^A-Za-z0-9]", "_", .cfg$label)
+  .out_dir <- file.path(params$output_dir, .safe_sp)
+  dir.create(.out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  .net_summary <- tibble(
+    species           = .cfg$label,
+    n_candidates      = .n_pos,
+    n_network_genes   = .n_all,
+    n_edges           = nrow(.edges),
+    observed_edges_cc = .obs$edges_between,
+    possible_pairs    = .obs$possible_pairs,
+    density           = .obs$density,
+    p_degree_matched  = .perm_dm$p_val,
+    p_degree_length   = .perm_dl$p_val,
+    p_rewired         = .perm_rew$p_val,
+    p_naive           = .perm_naive$p_val,
+    wilcox_p_degree   = .w_test$p.value
+  )
+
+  write_tsv(.net_summary,     file.path(.out_dir, "network_summary.tsv"))
+  write_tsv(.cc_pairs,        file.path(.out_dir, "candidate_candidate_interactions.tsv"))
+  write_tsv(.connectivity,    file.path(.out_dir, "candidate_connectivity.tsv"))
+  write_tsv(.jk,              file.path(.out_dir, "jackknife_influence.tsv"))
+
+  all_network_summaries[[.sp]] <- .net_summary
+}
+```
+
+---
+
+## Cross-species summary
+
+```{r cross-species, results='asis'}
+if (length(all_network_summaries) > 1) {
+  .summary_all <- bind_rows(all_network_summaries) %>%
+    select(species, n_candidates, n_network_genes, n_edges,
+           observed_edges_cc, density,
+           p_degree_matched, p_degree_length, p_rewired, p_naive)
+
+  print(
+    kable(.summary_all, digits = 3,
+          caption = "Cross-species network summary") %>%
+      kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+      column_spec(which(names(.summary_all) %in%
+                          c("p_degree_matched", "p_degree_length", "p_rewired", "p_naive")),
+                  bold = TRUE)
+  )
+
+  write_tsv(
+    bind_rows(all_network_summaries),
+    file.path(params$output_dir, "all_species_network_summary.tsv")
+  )
+} else {
+  cat("*(only one species — cross-species table not generated)*\n")
+}
+```
+
+---
+
+## Session info
+
+```{r session-info}
+cat(sprintf("Experiment     : %s\n", params$experiment_name))
+cat(sprintf("Score threshold: %.2f\n", params$score_threshold))
+cat(sprintf("Permutations   : %d\n",   params$n_permutations))
+cat(sprintf("Seed           : %d\n",   params$seed))
+cat(sprintf("Species        : %s\n",   paste(names(params$species_configs), collapse = ", ")))
+cat(sprintf("Output dir     : %s\n",   params$output_dir))
+cat(sprintf("Date           : %s\n",   Sys.Date()))
+sessionInfo()
+```
