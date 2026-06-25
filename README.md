@@ -18,7 +18,7 @@ divergence estimation.
 
 ---
 
-## Scientific Background
+## Context
 
 The McDonald-Kreitman test compares rates of non-synonymous (N) and synonymous (S)
 substitutions at the divergence (D) and polymorphism (P) levels. Under strict
