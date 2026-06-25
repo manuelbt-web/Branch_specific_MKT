@@ -6,23 +6,11 @@
 
 ## Overview
 
-This repository contains all scripts and analysis pipelines associated with the publication:
-
-> **Signatures of positive selection in wild wheat relatives using a branch-specific
-> McDonald-Kreitman framework**
->
-> Manuel Barrientos Tecun *et al.* (in preparation)
-
-We apply a **branch-specific McDonald-Kreitman test** (MKT) to detect genes under
-positive selection in four wild grass species that gave rise to cultivated bread wheat
-(*Triticum aestivum*):
-
-| Species | Common name | Ancestral genome |
-|---------|-------------|-----------------|
-| *Aegilops speltoides* | Goat grass | B/G |
-| *Aegilops mutica* | Wild einkorn relative | T |
-| *Aegilops tauschii* | Tausch's goatgrass | D |
-| *Triticum urartu* | Red wild einkorn | A |
+This repository contains all scripts and analysis pipelines for a **branch-specific McDonald-Kreitman test** (MKT) to detect genes under positive selection in four wild  species:
+- *Aegilops speltoides*
+- *Aegilops mutica*
+- *Aegilops tauschii*
+- *Triticum urartu*
 
 The analysis identifies genes evolving under positive selection at the branch leading
 to each focal species, while using *T. aestivum* orthologs as the outgroup for
@@ -38,11 +26,10 @@ neutrality, the ratio D_N/D_S = P_N/P_S. An excess of non-synonymous divergence
 (D_N/D_S > P_N/P_S) signals positive selection.
 
 The **branch-specific** extension isolates divergence on a specific phylogenetic
-branch using a three-taxon scheme (focal species, outgroup, *T. aestivum*), allowing
+branch using a three-taxon scheme (focal species, outgroup 1, outgroup 2), allowing
 gene-by-gene inference of positive selection on branches leading to each wild species.
 
-The **imputed MKT** variant (Messer & Petrov 2013; Murga-Moreno *et al.* 2019) corrects
-for slightly deleterious mutations that inflate P_N, improving sensitivity.
+The **imputed MKT** variant (Murga-Moreno *et al.* 2022) corrects for slightly deleterious mutations that inflate P_N, improving sensitivity.
 
 ---
 
@@ -268,23 +255,6 @@ are versioned directly in the repository.
 
 ---
 
-## Citation
-
-If you use these scripts in your research, please cite:
-
-> Barrientos Tecun M. *et al.* (in preparation).
-> *Branch-specific signatures of positive selection in wild wheat relatives.*
-
-Please also cite the key tools used:
-
-- **imputed MKT**: Murga-Moreno J. *et al.* (2019) *Mol Biol Evol* — iMKT package
-- **MACSE**: Ranwez V. *et al.* (2011) *PLoS ONE*
-- **PAML/codeml**: Yang Z. (2007) *Mol Biol Evol*
-- **read2snp**: Gayral P. *et al.* (2013) *PLoS Genet*
-- **OrthoFinder**: Emms D.M. & Kelly S. (2019) *Genome Biol*
-- **DESeq2**: Love M.I. *et al.* (2014) *Genome Biol*
-
----
 
 ## License
 
@@ -295,17 +265,5 @@ This code is released under the **MIT License**. See [LICENSE](LICENSE) for deta
 ## Contact
 
 Manuel Barrientos Tecun
-INRAE — UMR GDEC
 manuel.barrientos@inrae.fr
 
-GitHub: [manuelbt-web](https://github.com/manuelbt-web)
-
----
-
-## Repository Companion
-
-The Python preprocessing tools (alignment pipeline, polymorphism computation,
-read2snp wrappers) are maintained separately at:
-
-> [manuelbt-web/python\_tool\_mkt](https://github.com/manuelbt-web/python_tool_mkt)
-> *(ongoing development)*
