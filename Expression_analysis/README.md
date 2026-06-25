@@ -21,13 +21,22 @@ the neutral background, for each stress condition independently.
 |------|-------------|
 | `render_expression.R` | **Main launcher** — fill in species configs and run |
 | `expression_analysis.Rmd` | Analysis template (called by the launcher) |
-| `SRP064598_count.tsv` | Cold stress RNA-seq counts |
-| `SRP045409_count.tsv` | Heat / drought stress RNA-seq counts |
-| `ERP013829_count.tsv` | *Fusarium graminearum* inoculation counts |
-| `SRP041017_count.tsv` | Powdery mildew + stripe rust counts |
-| `ERP009837_count.tsv` | *Zymoseptoria tritici* (Septoria) counts |
-| `DRP000768_count.tsv` | Phosphorus starvation counts |
-| `PAMP_Triggered_Imune_Response_count.tsv` | PAMP-triggered immune response counts |
+
+### RNA-seq count matrices (not versioned — obtain separately)
+
+The count matrices (`*_count.tsv`) are excluded from this repository due to their
+size (18–104 MB each). Download them from the public databases below and place them
+in this directory before running `render_expression.R`:
+
+| File | Database | Accession | Stress condition |
+|------|----------|-----------|-----------------|
+| `SRP064598_count.tsv` | NCBI SRA | SRP064598 | Cold stress |
+| `SRP045409_count.tsv` | NCBI SRA | SRP045409 | Heat / drought stress |
+| `ERP013829_count.tsv` | ENA | ERP013829 | *Fusarium graminearum* inoculation |
+| `SRP041017_count.tsv` | NCBI SRA | SRP041017 | Powdery mildew + stripe rust |
+| `ERP009837_count.tsv` | ENA | ERP009837 | *Zymoseptoria tritici* (Septoria) |
+| `DRP000768_count.tsv` | DDBJ | DRP000768 | Phosphorus starvation |
+| `PAMP_Triggered_Imune_Response_count.tsv` | — | — | PAMP-triggered immune response |
 
 ---
 
