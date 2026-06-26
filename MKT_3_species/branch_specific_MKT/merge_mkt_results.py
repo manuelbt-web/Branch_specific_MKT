@@ -142,20 +142,22 @@ def load_dnds(dnds_dir: str, strip_suffix: str) -> pd.DataFrame:
             df = pd.read_csv(path, sep=r"\s+", engine="python", dtype=str)
             df.columns = [c.strip() for c in df.columns]
 
-            # Check whether first column looks like a gene name column
-            # (not a number) — if so, use it; otherwise use the filename stem.
+            # Use the filename stem as gene_id for reliable joining.
+            # dNdSpiNpiS Contig_name column holds only the gene name within the
+            # alignment (e.g. "EVM0000002.1"), not the full HOG-enriched filename
+            # stem needed for joining (e.g. "EVM0000002_1_HOG0018301_NT_filtered").
+            # Always prefer the filename stem; drop first column if it looks like
+            # a name column to avoid duplication.
+            gene_id = gene_id_from_filename
             first_col = df.columns[0] if len(df.columns) > 0 else ""
             first_col_lower = first_col.lower()
             is_name_col = first_col_lower in (
-                "alignment", "gene", "gene_id", "locus", "name", "id"
+                "alignment", "gene", "gene_id", "locus", "name", "id",
+                "contig_name", "contig",
             ) or (len(df) > 0 and not str(df.iloc[0, 0]).replace(".", "").isnumeric())
-
-            if is_name_col and len(df) > 0:
-                gene_id = _strip(str(df.iloc[0, 0]), strip_suffix)
-                # Drop the name column — gene_id is added separately
+            if is_name_col:
+                # Drop the name column — gene_id is added from filename stem
                 df = df.iloc[:, 1:]
-            else:
-                gene_id = gene_id_from_filename
 
             df["gene_id"] = gene_id
             dfs.append(df)

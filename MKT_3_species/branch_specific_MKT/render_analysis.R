@@ -103,8 +103,20 @@ SPECIES_LIST <- list(
 # SECTION 2 — Shared settings
 # =============================================================================
 
-# Orthogroup table from orthogroup_table.py
-# Columns: orthogroup | Aegilops_speltoides | Aegilops_mutica | ...
+# Directory containing the divergence FASTAs from the split step
+# (02_split/divergence/).  Headers must be  >Species_name|gene_id  — the same
+# format produced by split_sequences_polymorphism_divergence.py.
+# The orthogroup table is generated automatically from this directory using
+# orthogroup_table.py.  Any species' split/divergence folder can be used since
+# all HOG FASTA files contain sequences for every species in the alignment.
+#
+# Set to "" to disable auto-generation and fall back to ORTHOGROUP_TABLE below.
+SPLIT_DIVERGENCE_DIR <- ""
+
+# Orthogroup table path.
+#   • If SPLIT_DIVERGENCE_DIR is set: this file is (re-)generated automatically.
+#   • If SPLIT_DIVERGENCE_DIR is "": this file must already exist.
+# Columns: orthogroup | Species_A | Species_B | ...
 ORTHOGROUP_TABLE <- "data/orthogroup_table.tsv"
 
 # Combined cross-species tables go here (created only when ≥2 species)
@@ -134,6 +146,41 @@ if (!file.exists(.rmd_file))
   stop("Rmd file not found: ", .rmd_file,
        "\nEnsure render_analysis.R and branch_specific_MKT_analysis.Rmd ",
        "are in the same directory.")
+
+
+# ── Auto-generate orthogroup table from split divergence FASTAs ───────────────
+
+if (nchar(SPLIT_DIVERGENCE_DIR) > 0) {
+  .split_dir <- normalizePath(SPLIT_DIVERGENCE_DIR, mustWork = FALSE)
+  if (!dir.exists(.split_dir))
+    stop("SPLIT_DIVERGENCE_DIR not found: ", .split_dir)
+
+  .ortho_py <- file.path(.rmd_dir, "..", "EnrichAlignment", "orthogroup_table.py")
+  .ortho_py <- normalizePath(.ortho_py, mustWork = FALSE)
+  if (!file.exists(.ortho_py))
+    stop("orthogroup_table.py not found at: ", .ortho_py,
+         "\nCheck that EnrichAlignment/ is in the same parent directory as branch_specific_MKT/.")
+
+  dir.create(dirname(normalizePath(ORTHOGROUP_TABLE, mustWork = FALSE)),
+             recursive = TRUE, showWarnings = FALSE)
+  message(sprintf("\nGenerating orthogroup table from: %s", .split_dir))
+  .ret <- system2(
+    "python3",
+    args = c(shQuote(.ortho_py),
+             "--input-dir", shQuote(.split_dir),
+             "--output",    shQuote(normalizePath(ORTHOGROUP_TABLE, mustWork = FALSE))),
+    stdout = TRUE, stderr = TRUE
+  )
+  message(paste(.ret, collapse = "\n"))
+  if (!file.exists(ORTHOGROUP_TABLE))
+    stop("orthogroup_table.py failed to generate: ", ORTHOGROUP_TABLE)
+  message(sprintf("Orthogroup table written to: %s\n", ORTHOGROUP_TABLE))
+}
+
+if (!file.exists(ORTHOGROUP_TABLE))
+  stop("Orthogroup table not found: ", ORTHOGROUP_TABLE,
+       "\nEither set SPLIT_DIVERGENCE_DIR to auto-generate it, ",
+       "or provide a pre-built file at ORTHOGROUP_TABLE.")
 
 
 # ── Validate SPECIES_LIST ─────────────────────────────────────────────────────

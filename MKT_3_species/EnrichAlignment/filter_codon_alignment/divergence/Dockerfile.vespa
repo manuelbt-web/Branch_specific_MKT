@@ -75,6 +75,24 @@ RUN /opt/conda/envs/${PY2_ENV}/bin/pip install --no-cache-dir "dendropy==4.4.0"
 ENV VESPA_HOME=/opt/vespa
 RUN git clone --depth 1 --branch "${VESPA_REF}" "${VESPA_REPO}" "${VESPA_HOME}"
 
+# ── Add VESPA Perl scripts to PATH with correct @INC ─────────────────────────
+# VESPA calls GenerateCodemlWorkspace.pl by name (no full path).
+# The CodemlWrapper Perl module lives in /opt/vespa/, so we need -I/opt/vespa.
+# Create a shell wrapper so Perl can find the module.
+#
+# Also lower MIN_SEQUENCES from 7 to 3 so VESPA accepts 3-taxon alignments
+# (the standard case for branch-specific MKT with one focal + two outgroups).
+RUN apt-get update -qq \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -qq --no-install-recommends perl \
+    && rm -rf /var/lib/apt/lists/* \
+    && sed -i 's/use constant MIN_SEQUENCES => 7/use constant MIN_SEQUENCES => 3/' \
+         /opt/vespa/CodemlWrapper/Alignment.pm \
+    && sed -i 's/use constant MIN_GENES => 7/use constant MIN_GENES => 3/' \
+         /opt/vespa/CodemlWrapper/Tree.pm \
+    && printf '#!/bin/sh\nexec perl -I/opt/vespa /opt/vespa/GenerateCodemlWorkspace.pl "$@"\n' \
+         > /usr/local/bin/GenerateCodemlWorkspace.pl \
+    && chmod +x /usr/local/bin/GenerateCodemlWorkspace.pl
+
 # ── Thin wrapper: `vespa <command> [args...]` ──────────────────────────────────
 RUN printf '#!/bin/sh\nexec /opt/conda/envs/vespa_py27/bin/python /opt/vespa/vespa.py "$@"\n' \
       > /usr/local/bin/vespa \

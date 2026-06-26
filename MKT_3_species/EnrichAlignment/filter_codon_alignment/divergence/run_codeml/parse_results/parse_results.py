@@ -143,14 +143,16 @@ def _extract_node_species_map(txt: str) -> Dict[int, str]:
     """
     Parse PAML's labeled tree section to map node numbers → species names.
 
-    PAML prints terminal nodes as 'SpeciesName_NodeNum' in the labeled tree:
-      ((Aegilopsspeltoides_1: 0.015, Aegilopstauschii_2: 0.045)_3: ...)
-    Since species names have been cleaned (no underscores), the trailing _N
-    is the only underscore, making the regex unambiguous.
+    Handles two formats:
+    1. Newick tree with _N node suffixes (standard PAML verbose output):
+         ((Aegilopsspeltoides_1: 0.015, Aegilopstauschii_2: 0.045)_3: ...)
+    2. Codon frequency section (3-taxon PAML output):
+         #1: Aegilopsspeltoides
+         #2: Aegilopsmutica
     """
     node_map: Dict[int, str] = {}
 
-    # Try "Tree with node labels for Rod Page's TreeView"
+    # Format 1: "Tree with node labels for Rod Page's TreeView"
     m = re.search(
         r"(?:Tree with node labels[^\n]*|TreeView[^\n]*)\s*\n\s*([^\n]+)",
         txt, re.IGNORECASE
@@ -163,6 +165,11 @@ def _extract_node_species_map(txt: str) -> Dict[int, str]:
         tree_str = m.group(0) if not m.lastindex else m.group(1)
         for mm in re.finditer(r"([A-Za-z][A-Za-z0-9]+)_(\d+)", tree_str):
             node_map[int(mm.group(2))] = mm.group(1)
+
+    # Format 2: "#N: SpeciesName" lines (printed in 3x4 codon frequency section)
+    if not node_map:
+        for mm in re.finditer(r"^#(\d+):\s+([A-Za-z][A-Za-z0-9]+)", txt, re.MULTILINE):
+            node_map[int(mm.group(1))] = mm.group(2)
 
     return node_map
 
@@ -177,9 +184,9 @@ def _parse_branch_table(txt: str, node_map: Dict[int, str]) -> List[Dict]:
     """
     rows: List[Dict] = []
 
-    # Find the table section by its header
+    # Find the table section by its header (may have extra columns like N*dN S*dS)
     header_m = re.search(
-        r"^\s*branch\s+t\s+N\s+S\s+dN/dS\s+dN\s+dS\s*$(.+?)(?:\n\s*\n|\Z)",
+        r"^\s*branch\s+t\s+N\s+S\s+dN/dS\s+dN\s+dS[^\n]*$(.+?)(?:\n\s*\n|\Z)",
         txt, re.MULTILINE | re.DOTALL | re.IGNORECASE
     )
     if not header_m:
@@ -270,11 +277,14 @@ def parse_branch_out(out_file: str, focal_species: str) -> Dict:
 
     lnL = _extract_lnL(txt)
 
-    # Foreground omega is the FIRST value printed for model=2
+    # Foreground omega is the LAST value on the "w (dN/dS) for branches:" line.
+    # PAML prints: background_omega ... foreground_omega (foreground last).
     fg_omega: Optional[float] = None
-    m = re.search(r"w \(dN/dS\) for branches:\s+([\-0-9\.eE+]+)", txt)
+    m = re.search(r"w \(dN/dS\) for branches:\s+(.+)", txt)
     if m:
-        fg_omega = _safe_float(m.group(1))
+        vals = re.findall(r"[\-0-9\.eE+]+", m.group(1))
+        if vals:
+            fg_omega = _safe_float(vals[-1])
 
     # Node → species name
     node_map = _extract_node_species_map(txt)

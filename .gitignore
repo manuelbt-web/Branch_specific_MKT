@@ -35,6 +35,17 @@ Expression_analysis/*_count.tsv
 *.tar.gz
 *.tar.bz2
 
+# ── PAML / codeml run artefacts (appear in cwd when codeml is invoked) ────────
+codeml.ctl
+lnf
+mlc
+rst
+rst1
+rub
+
+# ── Input data (not tracked; obtained separately) ─────────────────────────────
+Data/
+
 # ── Internal planning files ────────────────────────────────────────────────────
 prompt.md
 

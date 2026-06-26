@@ -150,7 +150,7 @@ def print_summary(
 
     print()
     print("=" * 60)
-    print("  Sequence Split — Summary")
+    print("  Sequence Split - Summary")
     print("=" * 60)
     print(f"  Files processed    : {len(results)}")
     if ok:
@@ -204,13 +204,13 @@ def process_file(
 
     if not overwrite and (d_path.exists() or p_path.exists()):
         if verbose:
-            print(f"[SKIP] {fpath.name} — outputs already exist")
+            print(f"[SKIP] {fpath.name} - outputs already exist")
         return {"gene": stem, "n_div": 0, "n_poly": 0, "n_total": 0,
                 "warn": "", "error": "skipped (outputs exist)"}
 
     seqs = read_fasta_ordered(fpath)
     if not seqs:
-        print(f"[WARN] {fpath.name}: empty file — skipped", file=sys.stderr)
+        print(f"[WARN] {fpath.name}: empty file - skipped", file=sys.stderr)
         return {"gene": stem, "n_div": 0, "n_poly": 0, "n_total": 0,
                 "warn": "empty file", "error": "empty"}
 
@@ -222,7 +222,7 @@ def process_file(
     write_fasta(d_path, div_seqs)
     write_fasta(p_path, poly_seqs)
 
-    msg = (f"[OK  ] {fpath.name}  →  "
+    msg = (f"[OK  ] {fpath.name}  -> "
            f"div={len(div_seqs)}, poly={len(poly_seqs)}")
     if warn:
         msg += f"  [!] {warn}"
@@ -360,8 +360,8 @@ def main() -> None:
 
         if not result["error"]:
             print()
-            print(f"Divergence seqs   : {n_div}  → {div_out / (stem + '_divergence.fasta')}")
-            print(f"Polymorphism seqs : {n_poly}  → {poly_out / (stem + '_polymorphism.fasta')}")
+            print(f"Divergence seqs   : {n_div}  ->{div_out / (stem + '_divergence.fasta')}")
+            print(f"Polymorphism seqs : {n_poly}  ->{poly_out / (stem + '_polymorphism.fasta')}")
             if n_poly == 0:
                 print("[WARN] No polymorphism sequences — polymorphism FASTA is empty.")
         return

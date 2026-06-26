@@ -110,17 +110,19 @@ if (nchar(params$focal_species_in_ortho_table) > 0) {
   }
 }
 
-# Build rename map:  "Aegilops_mutica" → "mutica_ortholog"
+# Build rename map:  old "Aegilops_mutica" → new "mutica_ortholog"
+# dplyr convention for rename(all_of(x)): names = new names, values = old names
 rename_map <- setNames(
-  paste0(sapply(ortho_species, short_name), "_ortholog"),
-  ortho_species
+  ortho_species,
+  paste0(sapply(ortho_species, short_name), "_ortholog")
 )
 
 ortho_renamed <- ortho_raw %>%
   rename(all_of(rename_map))
 
 ortholog_cols <- paste0(sapply(ortho_species, short_name), "_ortholog")
-focal_ortho_col <- rename_map[focal_sp_col]   # e.g. "speltoides_ortholog"
+new_name_of_focal <- paste0(short_name(focal_sp_col), "_ortholog")
+focal_ortho_col <- new_name_of_focal   # e.g. "speltoides_ortholog"
 other_ortho_cols <- setdiff(ortholog_cols, focal_ortho_col)
 
 cat("Orthogroup table: ", nrow(ortho_renamed), "HOGs × ",
@@ -349,6 +351,7 @@ FDR correction: Benjamini-Hochberg (BH).
 
 ```{r write_output}
 results <- bs_imp %>%
+  mutate(PnNeutral = round(PnNeutral_safe)) %>%
   select(
     gene_id, ortholog, all_of(ortholog_cols),
     number_sites, num_codons_eff,
@@ -357,7 +360,7 @@ results <- bs_imp %>%
     polymorphism_count, num_pol_S, num_pol_NS, sample_size,
     PnMinus, PnGreater, PsMinus, PsGreater,
     ratioPs, PnNeutral_estimation,
-    PnNeutral = round(PnNeutral_safe), deleterious,
+    PnNeutral, deleterious,
     dn_counts, ds_counts,
     dN, dS, N_codeml, S_codeml, omega,
     lnL_branch_model, lnL_m0_model, omega_m0, omega_diff,
@@ -684,28 +687,46 @@ Intersections among positive candidates across the four tests (DoS > 0 and
 raw p < 0.05). Up to 14 intersections shown, ordered by frequency.
 
 ```{r upset_plot, fig.width=9, fig.height=5, fig.cap="UpSet plot showing the number of positive selection candidates identified by each combination of tests. Bar heights show set sizes; connected dots show which tests are included in each intersection."}
+UPSET_SETS <- c("Standard_MKT", "Standard_impMKT",
+                "Branch_specific_MKT", "Branch_specific_impMKT")
+
 upset_df <- bs_imp %>%
   filter(pos_any) %>%
   transmute(
-    `Standard MKT`           = as.integer(pos_standard_MKT),
-    `Standard impMKT`        = as.integer(pos_standard_impMKT),
-    `Branch-specific MKT`    = as.integer(pos_branch_specific_MKT),
-    `Branch-specific impMKT` = as.integer(pos_branch_specific_impMKT)
+    Standard_MKT           = as.integer(pos_standard_MKT),
+    Standard_impMKT        = as.integer(pos_standard_impMKT),
+    Branch_specific_MKT    = as.integer(pos_branch_specific_MKT),
+    Branch_specific_impMKT = as.integer(pos_branch_specific_impMKT)
   ) %>%
   as.data.frame()
 
-upset(
-  upset_df,
-  sets = c("Standard MKT", "Standard impMKT",
-           "Branch-specific MKT", "Branch-specific impMKT"),
-  nintersects   = 14,
-  order.by      = "freq",
-  sets.bar.color = c(CLR_STD, CLR_IMP, CLR_BS, CLR_BS_IMP),
-  main.bar.color = "grey40",
-  text.scale     = 1.2,
-  point.size     = 3,
-  line.size      = 1
-)
+if (nrow(upset_df) > 0) {
+  tryCatch(
+    upset(
+      upset_df,
+      sets          = UPSET_SETS,
+      nintersects   = 14,
+      order.by      = "freq",
+      sets.bar.color = c(CLR_STD, CLR_IMP, CLR_BS, CLR_BS_IMP),
+      main.bar.color = "grey40",
+      text.scale     = 1.2,
+      point.size     = 3,
+      line.size      = 1
+    ),
+    error = function(e) {
+      message("UpSet plot unavailable: ", conditionMessage(e))
+      barplot(
+        colSums(upset_df),
+        col   = c(CLR_STD, CLR_IMP, CLR_BS, CLR_BS_IMP),
+        names.arg = c("Std", "Std imp", "BS", "BS imp"),
+        ylab  = "Candidates",
+        main  = "Positive candidates per test"
+      )
+    }
+  )
+} else {
+  message("No positive selection candidates — UpSet plot skipped.")
+}
 ```
 
 ### 8.2  MKT filter summary

@@ -575,6 +575,12 @@ def parse_args() -> argparse.Namespace:
         "--threads", type=int, default=1, metavar="N",
         help="Number of parallel worker processes (default: 1)",
     )
+    p.add_argument(
+        "--strip-suffix", default="", metavar="SUFFIX",
+        help="Strip this suffix from the filename stem before using it as gene_id "
+             "(e.g. '_polymorphism' to produce 'EVM0001_HOG0001' from "
+             "'EVM0001_HOG0001_polymorphism.fasta'). Default: no stripping.",
+    )
     return p.parse_args()
 
 
@@ -656,6 +662,14 @@ def main() -> None:
                 print(f"  [ERROR] {fpath.stem}: {exc}")
                 errors += 1
 
+    # Strip filename suffix from gene_id if requested
+    if args.strip_suffix:
+        sfx = args.strip_suffix
+        for row in stats_rows:
+            gid = row["gene_id"]
+            if gid.endswith(sfx):
+                row["gene_id"] = gid[: len(gid) - len(sfx)]
+
     stats_rows.sort(key=lambda r: r["gene_id"])
 
     with open(args.output, "w", newline="", encoding="utf-8") as fh:
@@ -674,7 +688,7 @@ def main() -> None:
 
     print()
     print("=" * 60)
-    print(f"  Done  —  {ok} genes  |  {errors} errors")
+    print(f"  Done  -  {ok} genes  |  {errors} errors")
     print(f"  Stats written: {args.output}")
     print("=" * 60)
 

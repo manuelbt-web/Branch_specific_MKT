@@ -153,7 +153,7 @@ run_vespa_codeml_setup() {
                 -v "${gene_dir}":/data \
                 -w /data \
                 "$DOCKER_IMAGE" \
-                codeml_setup -input=codeml_input -branch_file=branch_table.txt
+                codeml_setup -input=codeml_input -branch_file=/data/branch_table.txt
             ;;
         singularity)
             "$SIF_CMD" exec \

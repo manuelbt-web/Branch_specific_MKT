@@ -1,0 +1,34 @@
+==============================================================
+  input_preparation_for_dNdSpNpS
+==============================================================
+  Input dir   : /mnt/c/Users/barrientos/Documents/data/MKT_2024/article/Scripts/test/speltoides/01_filtered  (20 files)
+  Output dir  : /mnt/c/Users/barrientos/Documents/data/MKT_2024/article/Scripts/test/speltoides/04_divergence/dnds_input
+  Species     : Ae_speltoides
+  Outgroup    : Aegilops_mutica
+  Threads     : 1
+  Log         : /mnt/c/Users/barrientos/Documents/data/MKT_2024/article/Scripts/test/speltoides/04_divergence/dnds_input/prep_dndspnps.log
+==============================================================
+[OK]    EVM0000002_1_HOG0018301_NT_filtered_filtered.fasta — 16 focal + 1 outgroup (EVM0000002.1|Aegilops_mutica|Aegilops_mutica_Ammut_EIv1.0_0527770.1|outgroup)
+[OK]    EVM0000012_1_HOG0012570_NT_filtered_filtered.fasta — 16 focal + 1 outgroup (EVM0000012.1|Aegilops_mutica|Aegilops_mutica_Ammut_EIv1.0_0545190.1|outgroup)
+[OK]    EVM0000023_1_HOG0023050_NT_filtered_filtered.fasta — 16 focal + 1 outgroup (EVM0000023.1|Aegilops_mutica|Aegilops_mutica_Ammut_EIv1.0_0717050.1|outgroup)
+[OK]    EVM0000024_1_HOG0007309_NT_filtered_filtered.fasta — 16 focal + 1 outgroup (EVM0000024.1|Aegilops_mutica|Aegilops_mutica_Ammut_EIv1.0_0296130.1|outgroup)
+[OK]    EVM0000032_1_HOG0007577_NT_filtered_filtered.fasta — 16 focal + 1 outgroup (EVM0000032.1|Aegilops_mutica|Aegilops_mutica_Ammut_EIv1.0_0129270.1|outgroup)
+[OK]    EVM0000034_1_HOG0025520_NT_filtered_filtered.fasta — 16 focal + 1 outgroup (EVM0000034.1|Aegilops_mutica|Aegilops_mutica_Ammut_EIv1.0_0352510.1|outgroup)
+[OK]    EVM0000036_1_HOG0020160_NT_filtered_filtered.fasta — 16 focal + 1 outgroup (EVM0000036.1|Aegilops_mutica|Aegilops_mutica_Ammut_EIv1.0_0227660.1|outgroup)
+[OK]    EVM0000044_1_HOG0023887_NT_filtered_filtered.fasta — 16 focal + 1 outgroup (EVM0000044.1|Aegilops_mutica|Aegilops_mutica_Ammut_EIv1.0_0759480.1|outgroup)
+[OK]    EVM0000063_1_HOG0021090_NT_filtered_filtered.fasta — 16 focal + 1 outgroup (EVM0000063.1|Aegilops_mutica|Aegilops_mutica_Ammut_EIv1.0_0839760.1|outgroup)
+[OK]    EVM0000073_1_HOG0013180_NT_filtered_filtered.fasta — 16 focal + 1 outgroup (EVM0000073.1|Aegilops_mutica|Aegilops_mutica_Ammut_EIv1.0_0577370.1|outgroup)
+[OK]    EVM0000078_1_HOG0024623_NT_filtered_filtered.fasta — 16 focal + 1 outgroup (EVM0000078.1|Aegilops_mutica|Aegilops_mutica_Ammut_EIv1.0_0304790.1|outgroup)
+[OK]    EVM0000080_1_HOG0024089_NT_filtered_filtered.fasta — 16 focal + 1 outgroup (EVM0000080.1|Aegilops_mutica|Aegilops_mutica_Ammut_EIv1.0_0772370.1|outgroup)
+[OK]    EVM0000081_1_HOG0023198_NT_filtered_filtered.fasta — 16 focal + 1 outgroup (EVM0000081.1|Aegilops_mutica|Aegilops_mutica_Ammut_EIv1.0_0724500.1|outgroup)
+[OK]    EVM0000086_1_HOG0015158_NT_filtered_filtered.fasta — 16 focal + 1 outgroup (EVM0000086.1|Aegilops_mutica|Aegilops_mutica_Ammut_EIv1.0_0042740.1|outgroup)
+[OK]    EVM0000106_1_HOG0012761_NT_filtered_filtered.fasta — 16 focal + 1 outgroup (EVM0000106.1|Aegilops_mutica|Aegilops_mutica_Ammut_EIv1.0_0555300.1|outgroup)
+[OK]    EVM0000117_1_HOG0016192_NT_filtered_filtered.fasta — 16 focal + 1 outgroup (EVM0000117.1|Aegilops_mutica|Aegilops_mutica_Ammut_EIv1.0_0095510.1|outgroup)
+[OK]    EVM0000127_1_HOG0017365_NT_filtered_filtered.fasta — 16 focal + 1 outgroup (EVM0000127.1|Aegilops_mutica|Aegilops_mutica_Ammut_EIv1.0_0481220.1|outgroup)
+[OK]    EVM0000135_1_HOG0021575_NT_filtered_filtered.fasta — 16 focal + 1 outgroup (EVM0000135.1|Aegilops_mutica|Aegilops_mutica_Ammut_EIv1.0_0864530.1|outgroup)
+[OK]    EVM0000165_1_HOG0013463_NT_filtered_filtered.fasta — 16 focal + 1 outgroup (EVM0000165.1|Aegilops_mutica|Aegilops_mutica_Ammut_EIv1.0_0590090.1|outgroup)
+[OK]    EVM0000176_1_HOG0016901_NT_filtered_filtered.fasta — 16 focal + 1 outgroup (EVM0000176.1|Aegilops_mutica|Aegilops_mutica_Ammut_EIv1.0_0447480.1|outgroup)
+
+==============================================================
+  Done  —  20 processed  |  0 skipped  |  0 warnings/errors
+==============================================================
