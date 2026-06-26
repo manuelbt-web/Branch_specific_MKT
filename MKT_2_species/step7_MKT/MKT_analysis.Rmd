@@ -173,6 +173,7 @@ All columns from `merge_tables.py` output plus the 8 MKT statistics columns.
 
 ```{r final_table}
 results <- imp %>%
+  mutate(PnNeutral = round(PnNeutral_safe)) %>%
   select(
     gene_id,
     number_sites, num_codons_eff,
@@ -183,7 +184,7 @@ results <- imp %>%
     sample_size,
     PnMinus, PnGreater, PsMinus, PsGreater,
     ratioPs, PnNeutral_estimation,
-    PnNeutral          = round(PnNeutral_safe),
+    PnNeutral,
     deleterious,
     Dn_counts, Ds_counts,
     Standard_MKT,        standard_impMKT,

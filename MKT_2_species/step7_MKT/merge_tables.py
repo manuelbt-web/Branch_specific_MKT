@@ -31,7 +31,16 @@ Usage:
       --dndspnps     all_genes_dNdSpNpS.tsv \\
       --polymorphism step6_stats/polymorphism_stats.tsv \\
       --output       step7_merged.tsv \\
-      [--species     Ae_speltoides]
+      [--species     Ae_speltoides] \\
+      [--id-col      Contig_name]
+
+Notes on --id-col:
+  The dNdSpiNpiS TSV uses the FASTA header first field as the gene identifier
+  (column "Contig_name" by default).  polymorphisms_stats.py uses the alignment
+  filename stem as gene_id.  These may differ when the FASTA header first field
+  does not match the filename (e.g. "EVM0000002.1" vs "EVM0000002_HOG0001").
+  Use --id-col to specify whichever column in the dNdSpiNpiS TSV best matches
+  the gene_id values in the polymorphism table.
 """
 
 from __future__ import annotations
@@ -93,6 +102,13 @@ def parse_args() -> argparse.Namespace:
         help="Focal species name (e.g. 'Ae_speltoides'). "
              "Used only for informational output; not required for the merge.",
     )
+    p.add_argument(
+        "--id-col", default="Contig_name", metavar="COL",
+        help="Column in the dNdSpiNpiS TSV to use as the gene identifier for "
+             "joining with the polymorphism table. Default: 'Contig_name'. "
+             "Change this if Contig_name values do not match the gene_id values "
+             "produced by polymorphisms_stats.py (which uses FASTA filename stems).",
+    )
     return p.parse_args()
 
 
@@ -121,6 +137,7 @@ def main() -> None:
     print(f"  Polymorphism : {len(poly)} genes, {len(poly.columns)} columns")
     if args.species:
         print(f"  Species      : {args.species!r}")
+    print(f"  ID column    : {args.id_col!r}")
 
     # Verify the polymorphism table has the expected SDM columns
     required_poly = ["gene_id", "PnMinus", "PnGreater", "PsMinus", "PsGreater",
@@ -133,8 +150,16 @@ def main() -> None:
         )
 
     # ── Extract divergence counts from dNdSpiNpiS ─────────────────────────────
+    if args.id_col not in dnd.columns:
+        available = ", ".join(dnd.columns[:10].tolist())
+        sys.exit(
+            f"ERROR: --id-col '{args.id_col}' not found in dNdSpiNpiS table.\n"
+            f"       Available columns (first 10): {available}\n"
+            f"       Use --id-col to specify the correct gene identifier column."
+        )
+
     dnd_sub = pd.DataFrame()
-    dnd_sub["gene_id"]   = dnd["Contig_name"].str.strip()
+    dnd_sub["gene_id"]   = dnd[args.id_col].str.strip()
     dnd_sub["Dn_counts"] = _num(dnd, "fixN")
     dnd_sub["Ds_counts"] = _num(dnd, "fixS")
 
@@ -148,8 +173,16 @@ def main() -> None:
     print(f"  Merge result : {n_matched} genes with divergence data | "
           f"{n_miss} without dNdSpiNpiS match")
     if n_miss > 0:
-        print("  Unmatched genes (first 10):",
-              out.loc[out["Dn_counts"].isna(), "gene_id"].tolist()[:10])
+        unmatched = out.loc[out["Dn_counts"].isna(), "gene_id"].tolist()[:10]
+        print("  Unmatched genes (first 10):", unmatched)
+        if n_matched == 0:
+            print(
+                f"\n  WARNING: 0 genes matched.  The '{args.id_col}' column values in the\n"
+                f"  dNdSpiNpiS file do not match the gene_id values in the polymorphism\n"
+                f"  table.  Check that both originate from the same FASTA files and that\n"
+                f"  the FASTA header first field (→ Contig_name) matches the filename stem\n"
+                f"  (→ gene_id from polymorphisms_stats.py).  You may need --id-col."
+            )
 
     # ── Reorder columns ───────────────────────────────────────────────────────
     present = [c for c in OUTPUT_COLUMNS if c in out.columns]
