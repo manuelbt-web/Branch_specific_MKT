@@ -474,7 +474,7 @@ for (sp in sp_labels) {
   if (length(triple) > 0) {
     trip_df <- species_data[[sp]]$stats %>%
       filter(gene_id %in% triple) %>%
-      select(gene_id, ortholog, DnDs_branch_specific_counts, omega, lrt_pvalue = any_of("lrt_pvalue")) %>%
+      select(gene_id, ortholog, DnDs_branch_specific_counts, omega) %>%
       left_join(select(lrt_data[[sp]], gene_id, lrt_pvalue), by = "gene_id")
     cat("Genes in triple overlap:\n\n")
     print(kbl(trip_df) %>% kable_styling(bootstrap_options = c("striped", "condensed")))

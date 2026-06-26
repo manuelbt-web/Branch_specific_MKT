@@ -4,18 +4,25 @@
 # ==============================================================================
 #
 # For each gene directory produced by VESPA (Inferred_Genetree_*/), this script:
-#   1. Writes branch_table.txt listing the foreground (target) species for the
-#      VESPA branch model (the species whose lineage is under selection).
-#   2. Creates a codeml_input/ subdirectory.
-#   3. Copies the NT FASTA and cleans sequence headers:
+#   1. Creates a codeml_input/ subdirectory.
+#   2. Copies the NT FASTA and cleans sequence headers:
 #        - removes everything after '|' (species|gene_id → species)
 #        - removes underscores (Aegilops_tauschii → Aegilopstauschii)
-#   4. Copies the gene tree (.tre) and cleans its labels the same way.
+#   3. Copies the gene tree (.tre) and cleans its labels the same way.
+#   4. Writes branch_table.txt listing the species for the VESPA branch model.
+#        By default ALL species found in the FASTA headers are written
+#        (one per line), so codeml runs on every branch of the phylogeny.
+#        Pass --target-species to restrict to a subset.
 #
 # VESPA codeml_setup (next step: codeml_set_up.sh) reads codeml_input/ and
-# branch_table.txt to generate the full codeml workspace.
+# branch_table.txt to generate the full codeml workspace — one
+# cleaned_<species>/ directory per species listed in branch_table.txt.
 #
 # USAGE
+#   # Default: run codeml on EVERY branch (species auto-detected from FASTA)
+#   bash branch_table.sh --root-dir vespa_out/
+#
+#   # Restrict to a subset of species
 #   bash branch_table.sh \
 #       --root-dir       vespa_out/ \
 #       --target-species "Aegilopsspeltoides,Aegilopsmutica"
@@ -23,7 +30,6 @@
 #   # Custom gene-directory pattern (default: match all subdirs):
 #   bash branch_table.sh \
 #       --root-dir       vespa_out/ \
-#       --target-species "Aegilopsspeltoides" \
 #       --gene-pattern   "Am*"
 #
 # NOTE ON SPECIES NAMES IN BRANCH TABLE
@@ -31,6 +37,7 @@
 #   Original header:  >Aegilops_speltoides|TraesCS1A02G000001
 #   Cleaned name:      Aegilopsspeltoides
 #   (The header is split at '|', then all '_' are removed.)
+#   Auto-detection reads these cleaned names directly from cleaned.fasta.
 #
 # NOTE ON VESPA DIRECTORY STRUCTURE
 #   After VESPA infer_genetree, directories are named:
@@ -44,7 +51,7 @@ shopt -s nullglob
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 ROOT_DIR=""
-TARGET_SPECIES=""      # comma-separated, cleaned names (no underscores)
+TARGET_SPECIES=""      # optional; if empty, all species from FASTA are used
 GENE_PATTERN="*"       # glob pattern for the gene-level subdirectory
 FASTA_EXT="fasta"
 FORCE=false
@@ -55,6 +62,10 @@ cat <<'EOF'
 branch_table.sh — Prepare VESPA codeml_input directories
 
 USAGE
+  # Default: run codeml on every branch (species auto-detected from FASTA headers)
+  bash branch_table.sh --root-dir <dir>
+
+  # Restrict to specific species only
   bash branch_table.sh \
       --root-dir       <dir> \
       --target-species "<Sp1>,<Sp2>,..."
@@ -62,12 +73,13 @@ USAGE
 REQUIRED
   -r | --root-dir       DIR     Root directory containing Inferred_Genetree_*/ dirs
                                 (output from gene_tree.sh)
-  -t | --target-species LIST    Comma-separated foreground species for the branch
-                                model.  Names must be CLEANED (no underscores, no
-                                pipe characters).
-                                Example: "Aegilopsspeltoides,Aegilopsmutica"
 
 OPTIONAL
+  -t | --target-species LIST    Comma-separated foreground species for the branch
+                                model (cleaned names: no underscores, no pipes).
+                                Example: "Aegilopsspeltoides,Aegilopsmutica"
+                                Default: all species found in the FASTA headers
+                                (one cleaned_<species>/ model per branch).
   -p | --gene-pattern   PAT     Glob pattern for gene subdirectory name inside
                                 Inferred_Genetree_*/  (default: * = all)
                                 Example: "Am*"  to match Amblyopyrum muticum genes
@@ -79,10 +91,11 @@ SPECIES NAME FORMAT
   Names in --target-species must match the cleaned alignment headers:
     Original: >Aegilops_speltoides|TraesCS1A02G000001
     Cleaned:   Aegilopsspeltoides   (split at '|', remove '_')
-  List the species in the same order as their appearance in the alignment.
+  When --target-species is omitted, species are read from the cleaned FASTA
+  headers after copying — no manual specification needed.
 
 OUTPUT (per gene directory)
-  <gene_dir>/branch_table.txt        — foreground species list
+  <gene_dir>/branch_table.txt        — species list (one per line)
   <gene_dir>/codeml_input/cleaned.fasta  — cleaned NT alignment
   <gene_dir>/codeml_input/cleaned.tre    — cleaned gene tree
 EOF
@@ -105,26 +118,31 @@ done
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-[ -n "$ROOT_DIR"        ] || die "--root-dir is required"
-[ -n "$TARGET_SPECIES"  ] || die "--target-species is required (cleaned names, comma-separated)"
-[ -d "$ROOT_DIR"        ] || die "Root directory not found: $ROOT_DIR"
+[ -n "$ROOT_DIR" ] || die "--root-dir is required"
+[ -d "$ROOT_DIR" ] || die "Root directory not found: $ROOT_DIR"
 
 ROOT_DIR="$(cd "$ROOT_DIR" && pwd)"
 
-# Parse species list into newline-separated block for branch_table.txt
-BRANCH_TABLE_CONTENT=""
-IFS=',' read -ra SPECIES_ARRAY <<< "$TARGET_SPECIES"
-for sp in "${SPECIES_ARRAY[@]}"; do
-    sp="${sp// /}"  # strip any spaces
-    BRANCH_TABLE_CONTENT="${BRANCH_TABLE_CONTENT}${sp}"$'\n'
-done
+# Pre-compute branch_table content when --target-species is set (shared across all genes)
+FIXED_BRANCH_TABLE_CONTENT=""
+if [ -n "$TARGET_SPECIES" ]; then
+    IFS=',' read -ra SPECIES_ARRAY <<< "$TARGET_SPECIES"
+    for sp in "${SPECIES_ARRAY[@]}"; do
+        sp="${sp// /}"
+        FIXED_BRANCH_TABLE_CONTENT="${FIXED_BRANCH_TABLE_CONTENT}${sp}"$'\n'
+    done
+fi
 
 # ── Banner ────────────────────────────────────────────────────────────────────
 echo "======================================================"
 echo "  branch_table.sh — Prepare codeml input directories"
 echo "======================================================"
 echo "  Root dir         : $ROOT_DIR"
-echo "  Target species   : $TARGET_SPECIES"
+if [ -n "$TARGET_SPECIES" ]; then
+    echo "  Target species   : $TARGET_SPECIES"
+else
+    echo "  Target species   : [auto-detect from FASTA headers — all branches]"
+fi
 echo "  Gene pattern     : $GENE_PATTERN"
 echo "  FASTA extension  : .$FASTA_EXT"
 echo "======================================================"
@@ -151,14 +169,10 @@ for gene_dir in "$ROOT_DIR"/Inferred_Genetree_*/${GENE_PATTERN}; do
         fi
     fi
 
-    # 1. Write branch_table.txt
-    printf '%s' "$BRANCH_TABLE_CONTENT" > "${gene_dir}/branch_table.txt"
-    echo "  branch_table.txt: $(echo "$TARGET_SPECIES" | tr ',' ' ')"
-
-    # 2. Create codeml_input/ directory
+    # 1. Create codeml_input/ directory
     mkdir -p "$codeml_dir"
 
-    # 3. Find NT FASTA (prefer *_NT* or *_aligned_NT* naming)
+    # 2. Find NT FASTA (prefer *_NT* or *_aligned_NT* naming)
     fasta_file=""
     for candidate in \
         "${gene_dir}"/*_aligned_NT."${FASTA_EXT}" \
@@ -182,7 +196,7 @@ for gene_dir in "$ROOT_DIR"/Inferred_Genetree_*/${GENE_PATTERN}; do
         (( WARN++ )) || true
     fi
 
-    # 4. Find gene tree (.tre)
+    # 3. Find gene tree (.tre)
     tree_file=""
     for candidate in \
         "${gene_dir}"/*.tre \
@@ -205,6 +219,32 @@ for gene_dir in "$ROOT_DIR"/Inferred_Genetree_*/${GENE_PATTERN}; do
         echo "  [WARN] No .tre file found in $gene_dir" >&2
         (( WARN++ )) || true
     fi
+
+    # 4. Determine species list for branch_table.txt
+    if [ -n "$TARGET_SPECIES" ]; then
+        # Explicit list supplied by the user
+        BRANCH_TABLE_CONTENT="$FIXED_BRANCH_TABLE_CONTENT"
+        echo "  branch_table.txt: $TARGET_SPECIES"
+    elif [ -f "${codeml_dir}/cleaned.fasta" ]; then
+        # Auto-detect: collect every unique >Header from the cleaned FASTA.
+        # Headers are already stripped of '|' and '_' by the sed step above.
+        BRANCH_TABLE_CONTENT=""
+        while IFS= read -r header; do
+            sp="${header#>}"
+            sp="${sp%% *}"   # first word only (before any space or tab)
+            BRANCH_TABLE_CONTENT="${BRANCH_TABLE_CONTENT}${sp}"$'\n'
+        done < <(grep '^>' "${codeml_dir}/cleaned.fasta" | sort -u)
+        sp_list="$(printf '%s' "$BRANCH_TABLE_CONTENT" | tr '\n' ',' | sed 's/,$//')"
+        echo "  branch_table.txt: [auto] $sp_list"
+    else
+        echo "  [WARN] Cannot write branch_table.txt — no FASTA and no --target-species" >&2
+        (( WARN++ )) || true
+        (( PROCESSED++ )) || true
+        continue
+    fi
+
+    # 5. Write branch_table.txt
+    printf '%s' "$BRANCH_TABLE_CONTENT" > "${gene_dir}/branch_table.txt"
 
     (( PROCESSED++ )) || true
 done
