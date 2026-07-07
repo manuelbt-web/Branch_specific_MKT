@@ -1011,8 +1011,12 @@ bind_rows(
 ) %>%
   filter(is.finite(pnps) & is.finite(dnds)) %>%
   mutate(Test = factor(Test, levels = names(TEST_COLOURS))) %>%
+  # Draw non-significant (grey) points first and significant (red) points last/on
+  # top within each facet, so candidates are never hidden under the grey cloud.
+  arrange(sel) %>%
   ggplot(aes(x = pnps, y = dnds, colour = sel)) +
-  geom_point(alpha = 0.5, size = 0.9) +
+  geom_point(data = ~ filter(.x, !sel), alpha = 0.5,  size = 0.9) +
+  geom_point(data = ~ filter(.x,  sel), alpha = 0.9,  size = 1.6) +
   geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40") +
   scale_colour_manual(
     values = c("TRUE" = CLR_POS, "FALSE" = CLR_NTRL),

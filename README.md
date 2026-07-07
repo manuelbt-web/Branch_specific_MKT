@@ -253,6 +253,28 @@ The `data/` directory for large raw files is excluded from version control
 (see `.gitignore`). Input summary statistics and processed pathway tables
 are versioned directly in the repository.
 
+### Built-in data-quality safeguards
+
+The `MKT_3_species/` pipeline includes automated checks so that a single
+malformed gene or file cannot silently corrupt the final result table:
+
+- **Gene ID normalization** — polymorphism, dNdSpiNpiS, and codeml stages each
+  append their own suffix to gene identifiers (e.g. `_polymorphism`,
+  `_divergence`, `_NT_filtered`). `merge_mkt_results.py` strips all known
+  pipeline suffixes down to a single canonical `EVM..._HOG...` key before
+  joining the three sources, and prints sample IDs from each source whenever
+  the match rate is low so a mismatch is diagnosable at a glance.
+- **All-gap codon masking** — `branch_table.sh` automatically replaces any
+  codon column that is 100% gaps with `NNN` before handing alignments to
+  `codeml_setup` (disable with `--no-mask-allgap-codons` if not needed).
+- **Clean dNdSpiNpiS output** — `dNdSpiNpiS.sbatch` writes the per-gene result
+  table directly to `<gene>.out`; run banners and warnings go to a separate
+  `logs/<gene>.log` so the two are never mixed.
+- **Orthogroup table contamination check** — `orthogroup_table.py` drops any
+  "species" column derived from a contaminated/mis-split FASTA header (i.e.
+  one present in fewer than 1% of input files) and reports what it dropped,
+  instead of silently adding a bogus one-off column.
+
 ---
 
 

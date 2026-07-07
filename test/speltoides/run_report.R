@@ -1,5 +1,5 @@
 #!/usr/bin/env Rscript
-# Test runner — Ae. speltoides branch-specific MKT (20 genes)
+# Full run — Ae. speltoides branch-specific MKT (3560 genes)
 #
 # HOW TO RUN (from the Scripts/ directory):
 #   Rscript test/speltoides/run_report.R

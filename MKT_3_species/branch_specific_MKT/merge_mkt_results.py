@@ -71,6 +71,31 @@ def _strip(name: str, suffix: str) -> str:
     return name
 
 
+# Suffixes added by different stages of the pipeline for the SAME gene:
+#   split_sequences_polymorphism_divergence.py  -> ..._polymorphism / ..._divergence
+#   filter_codon_alignment.py / MACSE naming    -> ..._NT_filtered / ..._filtered
+# Because polymorphism stats, dNdSpiNpiS, and codeml each run on a different
+# one of these tracks, their raw gene_id/filename stems diverge even though
+# they describe the same gene. Stripping ALL known suffixes (repeatedly, to
+# handle doubled-up names like "..._NT_filtered_filtered") reduces every
+# source to the same canonical "EVM..._HOG..." key before joining.
+_KNOWN_ID_SUFFIXES = (
+    "_polymorphism", "_divergence", "_NT_filtered", "_filtered",
+)
+
+
+def _canonical_id(name: str, extra_suffix: str = "") -> str:
+    """Strip all known pipeline suffixes (repeatedly) plus an optional extra one."""
+    prev = None
+    while prev != name:
+        prev = name
+        if extra_suffix:
+            name = _strip(name, extra_suffix)
+        for suf in _KNOWN_ID_SUFFIXES:
+            name = _strip(name, suf)
+    return name
+
+
 # ── 1. Polymorphism stats ─────────────────────────────────────────────────────
 
 def load_polymorphism(poly_dir: str) -> pd.DataFrame:
@@ -90,25 +115,34 @@ def load_polymorphism(poly_dir: str) -> pd.DataFrame:
         path = os.path.join(poly_dir, fname)
         try:
             df = pd.read_csv(path, sep="\t", dtype=str)
-            dfs.append(df)
         except Exception as exc:
             print(f"  [WARN] Cannot read {fname}: {exc}", file=sys.stderr)
+            continue
+        if "gene_id" not in df.columns:
+            # Not a per-gene polymorphism table (e.g. a companion SFS file
+            # like folded_sfs.tsv sitting in the same directory) — skip it
+            # rather than silently corrupting the concatenated result.
+            print(
+                f"  [WARN] Skipping {fname}: no 'gene_id' column "
+                f"(columns found: {list(df.columns)})",
+                file=sys.stderr,
+            )
+            continue
+        dfs.append(df)
 
     if not dfs:
-        sys.exit("ERROR: No polymorphism TSV files could be read.")
+        sys.exit(
+            "ERROR: No polymorphism TSV files with a 'gene_id' column could be read "
+            f"in {poly_dir}."
+        )
 
     result = pd.concat(dfs, ignore_index=True)
-
-    if "gene_id" not in result.columns:
-        sys.exit(
-            "ERROR: Polymorphism TSV files must contain a 'gene_id' column.\n"
-            f"       Columns found: {list(result.columns)}"
-        )
+    result["gene_id"] = result["gene_id"].apply(_canonical_id)
 
     # Convert numeric columns to float where possible
     result = _coerce_numeric(result, exclude=["gene_id", "downsampled", "nt_engine"])
 
-    print(f"  Polymorphism : {len(result)} genes  ({len(tsv_files)} files)")
+    print(f"  Polymorphism : {len(result)} genes  ({len(dfs)} file(s) used)")
     return result
 
 
@@ -136,7 +170,7 @@ def load_dnds(dnds_dir: str, strip_suffix: str) -> pd.DataFrame:
     for fname in out_files:
         # gene_id from filename stem, with optional suffix strip
         stem = re.sub(r"\.out$", "", fname, flags=re.IGNORECASE)
-        gene_id_from_filename = _strip(stem, strip_suffix)
+        gene_id_from_filename = _canonical_id(stem, strip_suffix)
         path = os.path.join(dnds_dir, fname)
         try:
             df = pd.read_csv(path, sep=r"\s+", engine="python", dtype=str)
@@ -261,9 +295,10 @@ def load_codeml(
     if rename:
         df = df.rename(columns=rename)
 
-    # Strip suffix from gene_id if requested
-    if "gene_id" in df.columns and strip_suffix:
-        df["gene_id"] = df["gene_id"].apply(lambda x: _strip(str(x), strip_suffix))
+    # Normalize gene_id to the canonical form (strips known pipeline suffixes
+    # such as "_divergence" plus any extra --strip-suffix given)
+    if "gene_id" in df.columns:
+        df["gene_id"] = df["gene_id"].apply(lambda x: _canonical_id(str(x), strip_suffix))
 
     df = _coerce_numeric(
         df, exclude=["gene_id", "species", "ortholog"]
@@ -300,7 +335,7 @@ def merge_all(
     # Step 1: polymorphism ← dNdSpiNpiS
     merged = pd.merge(poly, dnds_sub, on="gene_id", how="left")
     n_div = merged["dn_counts"].notna().sum() if "dn_counts" in merged.columns else 0
-    print(f"  poly ← dNdSpiNpiS : {len(merged)} rows, {n_div} matched")
+    print(f"  poly <- dNdSpiNpiS : {len(merged)} rows, {n_div} matched")
 
     # Select codeml columns to carry forward
     codeml_keep = ["gene_id"] + [
@@ -318,7 +353,7 @@ def merge_all(
     # Step 2: merged ← codeml
     merged = pd.merge(merged, codeml_sub, on="gene_id", how="left")
     n_codeml = merged["ortholog"].notna().sum() if "ortholog" in merged.columns else 0
-    print(f"  poly ← codeml     : {len(merged)} rows, {n_codeml} matched")
+    print(f"  poly <- codeml     : {len(merged)} rows, {n_codeml} matched")
 
     return merged
 
@@ -332,10 +367,12 @@ def _coerce_numeric(df: pd.DataFrame, exclude: List[str]) -> pd.DataFrame:
     for col in df.columns:
         if col in exclude:
             continue
-        try:
-            df[col] = pd.to_numeric(df[col], errors="ignore")
-        except Exception:
-            pass
+        converted = pd.to_numeric(df[col], errors="coerce")
+        # Only keep the numeric conversion if it didn't turn valid values into
+        # NaN (i.e. the column really was numeric) — mirrors the old
+        # errors="ignore" behaviour without relying on its deprecated warning.
+        if converted.notna().sum() >= df[col].notna().sum():
+            df[col] = converted
     return df
 
 
@@ -443,8 +480,15 @@ def main() -> None:
     if args.verbose:
         print(f"  Column list: {list(merged.columns)}")
 
-    # Warn about low match rates
+    # Warn about low match rates, and show sample IDs from each source so a
+    # gene_id format mismatch (the most common cause) is diagnosable at a
+    # glance instead of requiring manual file inspection.
     n_poly = len(merged)
+    sample_ids = {
+        "polymorphism": poly["gene_id"].dropna().head(3).tolist() if "gene_id" in poly.columns else [],
+        "dNdSpiNpiS":   dnds["gene_id"].dropna().head(3).tolist() if "gene_id" in dnds.columns else [],
+        "codeml":       codeml["gene_id"].dropna().head(3).tolist() if "gene_id" in codeml.columns else [],
+    }
     for col, label in [("dn_counts", "dNdSpiNpiS"), ("ortholog", "codeml")]:
         if col in merged.columns:
             n_matched = merged[col].notna().sum()
@@ -452,8 +496,11 @@ def main() -> None:
             if pct < 80:
                 print(
                     f"  [WARN] Only {pct:.0f}% of genes matched {label} data "
-                    f"({n_matched}/{n_poly}). Check --strip-suffix or gene ID format."
+                    f"({n_matched}/{n_poly}). Sample gene_id values after "
+                    f"normalization (should share the same base form):"
                 )
+                for src, ids in sample_ids.items():
+                    print(f"           {src:12s}: {ids}")
 
 
 if __name__ == "__main__":

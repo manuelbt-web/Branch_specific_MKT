@@ -55,6 +55,7 @@ TARGET_SPECIES=""      # optional; if empty, all species from FASTA are used
 GENE_PATTERN="*"       # glob pattern for the gene-level subdirectory
 FASTA_EXT="fasta"
 FORCE=false
+NO_MASK_ALLGAP=false
 
 # ── Help ──────────────────────────────────────────────────────────────────────
 show_help() {
@@ -85,6 +86,11 @@ OPTIONAL
                                 Example: "Am*"  to match Amblyopyrum muticum genes
   -e | --fasta-ext      EXT     FASTA file extension (default: fasta)
   -f | --force                  Overwrite existing codeml_input/ directories
+  --no-mask-allgap-codons        Skip the automatic all-gap-codon -> NNN masking
+                                pass (see below). Only disable this if you are
+                                certain every input codon column already has at
+                                least one non-gap sequence (e.g. you always run
+                                filter_codon_alignment.py first).
   -h | --help                   Show this message
 
 SPECIES NAME FORMAT
@@ -94,9 +100,18 @@ SPECIES NAME FORMAT
   When --target-species is omitted, species are read from the cleaned FASTA
   headers after copying — no manual specification needed.
 
+ALL-GAP CODON MASKING (automatic, on by default)
+  VESPA's codeml_setup hard-rejects any alignment with a codon column where
+  EVERY sequence is a gap ("no sequence in site N"). This is expected raw
+  MACSE output whenever filter_codon_alignment.py has not already replaced
+  such columns with NNN. After writing codeml_input/cleaned.fasta for every
+  gene, this script automatically runs mask_allgap_codons.py to NNN-mask any
+  remaining all-gap codons (a no-op if none exist), so codeml_setup does not
+  fail across the board. Requires python3 in PATH.
+
 OUTPUT (per gene directory)
   <gene_dir>/branch_table.txt        — species list (one per line)
-  <gene_dir>/codeml_input/cleaned.fasta  — cleaned NT alignment
+  <gene_dir>/codeml_input/cleaned.fasta  — cleaned NT alignment (all-gap codons NNN-masked)
   <gene_dir>/codeml_input/cleaned.tre    — cleaned gene tree
 EOF
 }
@@ -111,6 +126,7 @@ while [ $# -gt 0 ]; do
         -p|--gene-pattern)    GENE_PATTERN="$2";     shift 2 ;;
         -e|--fasta-ext)       FASTA_EXT="$2";        shift 2 ;;
         -f|--force)           FORCE=true;            shift ;;
+        --no-mask-allgap-codons) NO_MASK_ALLGAP=true; shift ;;
         -h|--help)            show_help; exit 0 ;;
         *) echo "ERROR: Unknown argument: '$1'" >&2; show_help >&2; exit 1 ;;
     esac
@@ -248,6 +264,21 @@ for gene_dir in "$ROOT_DIR"/Inferred_Genetree_*/${GENE_PATTERN}; do
 
     (( PROCESSED++ )) || true
 done
+
+# ── All-gap codon masking ───────────────────────────────────────────────────
+MASK_SUMMARY=""
+if [ "$NO_MASK_ALLGAP" = false ]; then
+    MASK_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/mask_allgap_codons.py"
+    if command -v python3 &>/dev/null && [ -f "$MASK_SCRIPT" ]; then
+        echo ""
+        echo "Masking all-gap codons (NNN) in codeml_input/cleaned.fasta ..."
+        MASK_SUMMARY="$(python3 "$MASK_SCRIPT" --root-dir "$ROOT_DIR")"
+        echo "  $MASK_SUMMARY"
+    else
+        echo "[WARN] python3 or mask_allgap_codons.py not found — skipping all-gap-codon masking." >&2
+        echo "       codeml_setup will fail on genes with a shared-indel codon column." >&2
+    fi
+fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""

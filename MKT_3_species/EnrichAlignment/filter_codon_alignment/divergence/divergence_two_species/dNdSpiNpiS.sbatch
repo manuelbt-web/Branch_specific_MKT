@@ -85,12 +85,19 @@ Binary download:
   https://kimura.univ-montp2.fr/PopPhyl/index.php?section=tools
 
 Outputs (in OUTPUT_DIR):
-  <gene>.out       Raw dNdSpiNpiS result (dN, dS, pN, pS, dN/dS, pN/pS, DoS, NI)
+  <gene>.out       Clean per-contig TSV table (Contig_name, fixN, fixS, piN,
+                   piS, ...) — written directly by dNdSpiNpiS via -out=, safe
+                   to pass this directory straight to
+                   merge_mkt_results.py --divergence-dir.
+  logs/<gene>.log  Run banner / parameters / warnings for that gene (kept
+                   separate from <gene>.out so the two are never confused —
+                   older pipeline versions captured both to the same
+                   <gene>.out file, which merge_mkt_results.py cannot parse).
   log_<job>.txt    SLURM log per task
 
 Merge all results:
-  head -1 $(ls step5_out/*.out | head -1) > all_genes_dNdSpNpS.tsv
-  for f in step5_out/*.out; do tail -n +2 "$f"; done >> all_genes_dNdSpNpS.tsv
+  head -1 $(ls OUTPUT_DIR/*.out | head -1) > all_genes_dNdSpNpS.tsv
+  for f in OUTPUT_DIR/*.out; do tail -n +2 "$f"; done >> all_genes_dNdSpNpS.tsv
 EOF
 }
 
@@ -140,9 +147,21 @@ fi
 
 FASTA_FILE="${FASTA_FILES[${SLURM_ARRAY_TASK_ID:-0}]}"
 BASENAME=$(basename "$FASTA_FILE" .fasta)
+# The clean per-contig TSV table (fixN, fixS, piN, piS, ...) is written
+# DIRECTLY to this path via -out= below — dNdSpiNpiS writes exactly the path
+# it is given with no extra suffix appended, so passing a path that already
+# ends in .out makes the tool's own output land exactly where
+# merge_mkt_results.py expects it (--divergence-dir), with no separate
+# copy/rename step required.
 OUT_FILE="${OUTPUT_DIR}/${BASENAME}.out"
+# The banner/log text (run parameters, warnings, progress) goes to a
+# separate logs/ subdirectory so it never collides with the clean table.
+LOG_DIR="${OUTPUT_DIR}/logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="${LOG_DIR}/${BASENAME}.log"
 
 # ── Banner ────────────────────────────────────────────────────────────────────
+{
 echo "======================================================"
 echo "  dNdSpiNpiS v1.0"
 echo "======================================================"
@@ -157,11 +176,13 @@ echo "  GC bins      : $GC_BIN"
 echo "  Gap/N cutoff : $GAP_N"
 echo "  Kappa        : $KAPPA"
 echo "  Output       : $OUT_FILE"
+echo "  Log          : $LOG_FILE"
 echo "======================================================"
+} | tee "$LOG_FILE"
 
 # Skip if output already exists
 if [ -f "$OUT_FILE" ] && [ -s "$OUT_FILE" ]; then
-    echo "[INFO] Output already exists for $BASENAME — skipping."
+    echo "[INFO] Output already exists for $BASENAME — skipping." | tee -a "$LOG_FILE"
     exit 0
 fi
 
@@ -174,12 +195,12 @@ fi
     -gapN_site="$GAP_N" \
     -kappa="$KAPPA" \
     -compute_distances=yes \
-    -out="${OUTPUT_DIR}/${BASENAME}" > "$OUT_FILE"
+    -out="$OUT_FILE" >> "$LOG_FILE" 2>&1
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 if [ -s "$OUT_FILE" ]; then
-    echo "[INFO] Output written: $OUT_FILE"
+    echo "[INFO] Output written: $OUT_FILE" | tee -a "$LOG_FILE"
 else
-    echo "[WARN] Output is empty for $BASENAME"
+    echo "[WARN] Output is empty for $BASENAME" | tee -a "$LOG_FILE"
 fi
-echo "[INFO] Finished on $(date)"
+echo "[INFO] Finished on $(date)" | tee -a "$LOG_FILE"

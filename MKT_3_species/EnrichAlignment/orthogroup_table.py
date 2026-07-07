@@ -173,6 +173,38 @@ def main() -> None:
     if not data:
         sys.exit("ERROR: No valid orthogroup data found. Check the file format.")
 
+    # ── Drop spurious species columns from contaminated headers ─────────────────
+    # A "species" appearing in only a handful of rows is almost always not a
+    # real species name but a gene/individual ID that leaked into a divergence
+    # FASTA (e.g. a mis-split file whose header was ">EVM0001702.1|sp|..."
+    # instead of ">Aegilops_speltoides|..."). Real species names appear in most
+    # or all orthogroups. Keep only species present in at least 1% of files
+    # (minimum 2), and report anything dropped so the underlying data issue is
+    # visible rather than silently producing bogus one-off columns.
+    all_species: dict[str, int] = {}
+    for row in data.values():
+        for sp in row:
+            all_species[sp] = all_species.get(sp, 0) + 1
+
+    min_files = max(2, round(0.01 * len(files)))
+    real_species = {sp for sp, n in all_species.items() if n >= min_files}
+    dropped_species = {sp: n for sp, n in all_species.items() if sp not in real_species}
+
+    if dropped_species:
+        print(
+            f"\nDropped {len(dropped_species)} spurious 'species' column(s) "
+            f"(present in fewer than {min_files} file(s) — likely contaminated "
+            f"headers, e.g. a gene ID where a species name was expected):"
+        )
+        for sp, n in sorted(dropped_species.items(), key=lambda kv: -kv[1])[:20]:
+            print(f"  {sp}  ({n} file(s))")
+        if len(dropped_species) > 20:
+            print(f"  … and {len(dropped_species) - 20} more")
+        data = {
+            hog: {sp: gene for sp, gene in row.items() if sp in real_species}
+            for hog, row in data.items()
+        }
+
     # ── Build DataFrame ────────────────────────────────────────────────────────
     df = pd.DataFrame.from_dict(data, orient="index")
     df.index.name = "orthogroup"
