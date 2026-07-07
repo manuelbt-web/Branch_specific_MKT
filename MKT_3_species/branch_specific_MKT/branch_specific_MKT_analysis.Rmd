@@ -310,12 +310,16 @@ A gene is a **positive candidate** if DoS > 0 AND raw p-value < 0.05 in at
 least one of the four tests.
 
 ```{r mark_positive}
+# A gene can only be a candidate for a given test if it also passes that
+# test's own mk_filter() (Pn/Ps/Dn/Ds >= 1 and Pn+Ps >= 5) — otherwise DoS/p
+# are computed from too few counts to be meaningful (see std_mask/imp_mask/
+# bs_mask/bs_imp_mask above).
 bs_imp <- bs_imp %>%
   mutate(
-    pos_standard_MKT           = is_positive(DoS_MKT_standard,          standard_MKT_pvalue),
-    pos_standard_impMKT        = is_positive(DoS_impMKT_standard,        standard_impMKT_pvalue),
-    pos_branch_specific_MKT    = is_positive(DoS_branch_specific_MKT,    branch_specific_MKT_pvalue),
-    pos_branch_specific_impMKT = is_positive(DoS_branch_specific_impMKT, branch_specific_impMKT_pvalue),
+    pos_standard_MKT           = is_positive(DoS_MKT_standard,          standard_MKT_pvalue)          & std_mask,
+    pos_standard_impMKT        = is_positive(DoS_impMKT_standard,        standard_impMKT_pvalue)        & imp_mask,
+    pos_branch_specific_MKT    = is_positive(DoS_branch_specific_MKT,    branch_specific_MKT_pvalue)    & bs_mask,
+    pos_branch_specific_impMKT = is_positive(DoS_branch_specific_impMKT, branch_specific_impMKT_pvalue) & bs_imp_mask,
     pos_any    = pos_standard_MKT | pos_standard_impMKT |
                  pos_branch_specific_MKT | pos_branch_specific_impMKT,
     pos_any_bs = pos_branch_specific_MKT | pos_branch_specific_impMKT,
@@ -485,10 +489,17 @@ if (has_other) {
                         na = c("NA", "NaN", "")) %>%
       filter(!is.na(ortholog)) %>%
       mutate(
-        pos_std    = is_positive(DoS_MKT_standard,         standard_MKT_pvalue),
-        pos_imp    = is_positive(DoS_impMKT_standard,       standard_impMKT_pvalue),
-        pos_bs     = is_positive(DoS_branch_specific_MKT,   branch_specific_MKT_pvalue),
-        pos_bs_imp = is_positive(DoS_branch_specific_impMKT, branch_specific_impMKT_pvalue)
+        # Re-derive each test's mk_filter() mask from the raw counts carried
+        # in that species' own output table (the live std_mask/imp_mask/...
+        # vectors from this session don't apply to a different species' file).
+        pos_std    = is_positive(DoS_MKT_standard,         standard_MKT_pvalue) &
+                     mk_filter(num_pol_NS, num_pol_S, dn_counts, ds_counts),
+        pos_imp    = is_positive(DoS_impMKT_standard,       standard_impMKT_pvalue) &
+                     mk_filter(PnNeutral, num_pol_S, dn_counts, ds_counts),
+        pos_bs     = is_positive(DoS_branch_specific_MKT,   branch_specific_MKT_pvalue) &
+                     mk_filter(num_pol_NS, num_pol_S, Dn_branch_specific, Ds_branch_specific),
+        pos_bs_imp = is_positive(DoS_branch_specific_impMKT, branch_specific_impMKT_pvalue) &
+                     mk_filter(PnNeutral, num_pol_S, Dn_branch_specific, Ds_branch_specific)
       ) %>%
       filter(pos_std | pos_imp | pos_bs | pos_bs_imp) %>%
       mutate(
