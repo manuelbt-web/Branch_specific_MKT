@@ -34,10 +34,12 @@ different frequency cutoff without reprocessing the alignments.
 | Tool | Version | Installation |
 |---|---|---|
 | **Python** | ≥ 3.9 | system / conda |
-| **EggLib** | 3.5.2 | Pixi (see below) — optional but strongly recommended |
+| **EggLib** | 3.5.2 | Pixi (see below) — **required** |
 | **pandas** | any | `pip install pandas` (required for standalone `estimation_of_SDM.py`) |
 
 ### Install EggLib 3.5.2 with Pixi
+
+`egglib` on bioconda only ships `linux-64` builds:
 
 ```bash
 # 1. Install Pixi (if not already installed)
@@ -50,14 +52,26 @@ cd egglib_env
 sed -i 's/channels = \["conda-forge"\]/channels = ["conda-forge", "bioconda"]/' pixi.toml
 pixi add "python=3.11.*" "egglib==3.5.2"
 
-# 3. Activate the environment before running the scripts
-pixi shell
+# 3. Run the polymorphism script through this environment
+pixi run python polymorphisms_stats.py --input-dir ... --output ...
 ```
 
-When EggLib is not available, `polymorphisms_stats.py` falls back automatically
-to its built-in pure-Python implementation (same statistics, no external
-dependency).  The SFS produced by the pure-Python fallback is codon-based rather
-than site-based, but the format is identical.
+On native Windows, `pixi add egglib` cannot resolve (no `win-64` build exists
+on bioconda) — install WSL (`wsl --install`), then set up the Pixi environment
+above inside the WSL distribution. The Windows filesystem is reachable from
+WSL under `/mnt/c/...`, so `--input-dir`/`--output` can point at paths on the
+Windows drive directly.
+
+**EggLib is a hard requirement, not an optional accelerator.** Its
+`CodingDiversity` codon classification systematically differs from the
+built-in pure-Python fallback — validated on a real dataset (Ae. speltoides,
+3,560 genes), EggLib matched a hand-curated reference table on 94% of genes
+vs. only 61% for the fallback, which was enough to change branch-specific MKT
+candidate counts (46 vs. the correct 73). `polymorphisms_stats.py` therefore
+**exits with an error if EggLib is not importable**, unless you explicitly
+pass `--allow-builtin-fallback` (not recommended — only for quick,
+non-publication smoke tests). The SFS produced by the pure-Python fallback is
+also codon-based rather than site-based, though the file format is identical.
 
 ---
 
@@ -252,7 +266,8 @@ For selfing species, add `--haploid` to Step 6b only; Step 6a is unchanged.
 |---|---|---|
 | `No .fasta files found` | Wrong `--input-dir` path | Check `ls INPUT_DIR/*.fasta` |
 | All genes skipped | Wrong `--outgroup-tag` | Verify tag matches FASTA headers from Step 4 (default: `\|outgroup`) |
-| `nt_engine: builtin` in all rows | EggLib not installed | Activate the Pixi environment: `pixi shell` |
+| `ERROR: EggLib is not installed` | EggLib not importable in this environment | Activate the Pixi environment (`pixi shell` / `pixi run python ...`) — see Dependencies above. Windows: run it from WSL. |
+| `nt_engine: builtin` in all rows | Ran with `--allow-builtin-fallback` | Only for smoke tests — re-run without this flag through the EggLib environment for real results |
 | `NaN` for Tajima's D | Fewer than 2 segregating sites | Expected for monomorphic genes; not an error |
 | `NA` for `num_sites_S_egglib` | EggLib 3.5.2 does not expose `nseff_S` attribute | Check EggLib version; the pipeline remains functional |
 | `PnNeutral = NA` for many genes | No high-frequency S polymorphisms | Use a lower `--freq-cutoff` or check alignment quality |

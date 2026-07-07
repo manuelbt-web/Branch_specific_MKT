@@ -15,10 +15,14 @@ Statistics computed:
   pi_S          — mean pairwise differences at synonymous sites
   pi_NS         — mean pairwise differences at non-synonymous sites
 
-EggLib 3.5.2 is used for nucleotide-level statistics (lseff, S, Pi, D, thetaW)
-when available (install via pixi — see README.md).  Codon-level statistics
-(num_pol_S, num_pol_NS, pi_S, pi_NS) and the folded SFS are always computed
-with the built-in pure-Python implementation.
+EggLib 3.5.2 is required for all statistics (nucleotide-level: lseff, S, Pi, D,
+thetaW; codon-level: num_pol_S, num_pol_NS, pi_S, pi_NS; folded SFS) — install
+via pixi, see README.md. The pure-Python implementation is a fallback only:
+it systematically over-counts non-synonymous polymorphisms relative to
+EggLib's CodingDiversity (validated on Ae. speltoides: EggLib matched a
+reference table on 94% of genes vs. 61% for the pure-Python fallback), so the
+script refuses to run without EggLib unless --allow-builtin-fallback is
+passed explicitly.
 
 Usage:
   python polymorphisms_stats.py \
@@ -581,6 +585,15 @@ def parse_args() -> argparse.Namespace:
              "(e.g. '_polymorphism' to produce 'EVM0001_HOG0001' from "
              "'EVM0001_HOG0001_polymorphism.fasta'). Default: no stripping.",
     )
+    p.add_argument(
+        "--allow-builtin-fallback", action="store_true",
+        help="Allow running without EggLib, using the pure-Python fallback. "
+             "NOT recommended: it systematically over-counts non-synonymous "
+             "polymorphisms relative to EggLib (see module docstring). "
+             "Without this flag, the script exits with an error if EggLib is "
+             "not importable — activate the pixi EggLib environment instead "
+             "(see README.md).",
+    )
     return p.parse_args()
 
 
@@ -603,6 +616,19 @@ SFS_FIELDS = ["gene", "sample_size", "bin", "frequency", "syn_count", "nonsyn_co
 
 def main() -> None:
     args = parse_args()
+
+    if not HAS_EGGLIB and not args.allow_builtin_fallback:
+        sys.exit(
+            "ERROR: EggLib is not installed in this Python environment.\n"
+            "       Polymorphism counts from the pure-Python fallback do NOT "
+            "match EggLib's CodingDiversity (validated on Ae. speltoides: "
+            "EggLib matched a reference table on 94% of genes vs. 61% for "
+            "the fallback), so this script refuses to run without it.\n"
+            "       Set up and activate the pixi EggLib environment (see "
+            "README.md, 'pixi shell'), or pass --allow-builtin-fallback to "
+            "run anyway and accept the accuracy loss."
+        )
+
     input_dir = Path(args.input_dir)
 
     if not input_dir.is_dir():
