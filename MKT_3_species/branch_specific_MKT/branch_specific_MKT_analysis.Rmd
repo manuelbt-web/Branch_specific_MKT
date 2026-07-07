@@ -1103,6 +1103,110 @@ p_om2 <- bs_imp_filtered %>%
 p_om1 + p_om2
 ```
 
+### 8.13  Dn/Ds vs Pn/Ps by species (candidates highlighted)
+
+Reproduces the `plot_pnps_dnds_by_species.R` figure inline: one Dn/Ds-vs-Pn/Ps
+panel per species (this focal species plus any others supplied via
+`params$other_results`), stacked by MKT test. A gene is drawn in red only if
+it is a genuine candidate for *that* test — i.e. it both clears that test's
+own `mk_filter()` and has DoS > 0 with raw p < 0.05 — matching the same
+gating used everywhere else in this report (§4.5, §7).
+
+```{r pnps_dnds_by_species_data}
+# Columns needed from each species' result table to recompute Pn/Ps/Dn/Ds and
+# significance for all four tests. Recomputing from raw counts (rather than
+# trusting a possibly-older file's own pos_* columns) keeps this consistent
+# even if an "other" species file predates a mk_filter/gating fix.
+pnps_dnds_cols <- c(
+  "num_pol_NS", "num_pol_S", "dn_counts", "ds_counts",
+  "PnNeutral", "Dn_branch_specific", "Ds_branch_specific",
+  "DoS_MKT_standard", "standard_MKT_pvalue",
+  "DoS_impMKT_standard", "standard_impMKT_pvalue",
+  "DoS_branch_specific_MKT", "branch_specific_MKT_pvalue",
+  "DoS_branch_specific_impMKT", "branch_specific_impMKT_pvalue"
+)
+
+current_sp_df <- bs_imp %>%
+  transmute(
+    num_pol_NS = Pn, num_pol_S = Ps,
+    dn_counts  = Dn, ds_counts = Ds,
+    PnNeutral  = PnNeutral_safe,
+    Dn_branch_specific = Dn_bs, Ds_branch_specific = Ds_bs,
+    DoS_MKT_standard, standard_MKT_pvalue,
+    DoS_impMKT_standard, standard_impMKT_pvalue,
+    DoS_branch_specific_MKT, branch_specific_MKT_pvalue,
+    DoS_branch_specific_impMKT, branch_specific_impMKT_pvalue
+  ) %>%
+  mutate(species = params$species)
+
+other_sp_dfs <- if (length(params$other_results) > 0) {
+  imap(params$other_results, function(path, sp_name) {
+    if (!file.exists(path)) {
+      warning("Other species file not found, skipping: ", path)
+      return(NULL)
+    }
+    read_tsv(path, show_col_types = FALSE, na = c("NA", "NaN", "")) %>%
+      select(any_of(pnps_dnds_cols)) %>%
+      mutate(species = sp_name)
+  }) %>% compact()
+} else {
+  list()
+}
+
+pnps_dnds_all <- bind_rows(current_sp_df, other_sp_dfs)
+```
+
+```{r plot_pnps_dnds_by_species, fig.width=10, fig.height=9, fig.cap="Dn/Ds vs Pn/Ps by species (columns) and MKT test (rows). Red: candidate (passes that test's mk_filter and DoS>0, p<0.05)."}
+pnps_dnds_tests <- list(
+  "Standard MKT"           = list(Pn = "num_pol_NS", Ps = "num_pol_S",
+                                   Dn = "dn_counts",  Ds = "ds_counts",
+                                   dos = "DoS_MKT_standard", pval = "standard_MKT_pvalue"),
+  "Standard impMKT"        = list(Pn = "PnNeutral",  Ps = "num_pol_S",
+                                   Dn = "dn_counts",  Ds = "ds_counts",
+                                   dos = "DoS_impMKT_standard", pval = "standard_impMKT_pvalue"),
+  "Branch-specific MKT"    = list(Pn = "num_pol_NS", Ps = "num_pol_S",
+                                   Dn = "Dn_branch_specific", Ds = "Ds_branch_specific",
+                                   dos = "DoS_branch_specific_MKT", pval = "branch_specific_MKT_pvalue"),
+  "Branch-specific impMKT" = list(Pn = "PnNeutral",  Ps = "num_pol_S",
+                                   Dn = "Dn_branch_specific", Ds = "Ds_branch_specific",
+                                   dos = "DoS_branch_specific_impMKT", pval = "branch_specific_impMKT_pvalue")
+)
+
+pnps_dnds_long <- imap_dfr(pnps_dnds_tests, function(cfg, test_label) {
+  pnps_dnds_all %>%
+    transmute(
+      species = species,
+      Pn = .data[[cfg$Pn]], Ps = .data[[cfg$Ps]],
+      Dn = .data[[cfg$Dn]], Ds = .data[[cfg$Ds]],
+      dos = .data[[cfg$dos]], pval = .data[[cfg$pval]]
+    ) %>%
+    mutate(
+      pnps      = Pn / Ps,
+      dnds      = Dn / Ds,
+      candidate = mk_filter(Pn, Ps, Dn, Ds) & is_positive(dos, pval),
+      Test      = factor(test_label, levels = names(pnps_dnds_tests))
+    ) %>%
+    filter(is.finite(pnps) & is.finite(dnds))
+}) %>%
+  arrange(candidate)   # draw candidates (red) last/on top within each panel
+
+ggplot(pnps_dnds_long, aes(x = dnds, y = pnps, colour = candidate)) +
+  geom_point(data = ~ filter(.x, !candidate), alpha = 0.5, size = 0.9) +
+  geom_point(data = ~ filter(.x,  candidate), alpha = 0.9, size = 1.6) +
+  scale_colour_manual(
+    values = c("TRUE" = CLR_POS, "FALSE" = CLR_NTRL),
+    labels = c("TRUE" = "Candidate", "FALSE" = "Not a candidate"),
+    name   = NULL
+  ) +
+  scale_x_log10() + scale_y_log10() +
+  facet_grid(Test ~ species, scales = "free") +
+  labs(title = "Dn/Ds vs Pn/Ps by species and MKT test",
+       x = "Dn / Ds (log scale)", y = "Pn / Ps (log scale)") +
+  theme(legend.position = "bottom",
+        strip.text.y = element_text(angle = 0, face = "bold"),
+        strip.text.x = element_text(face = "italic"))
+```
+
 ---
 
 ## Session info
