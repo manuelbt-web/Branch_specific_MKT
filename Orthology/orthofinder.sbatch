@@ -38,9 +38,10 @@
 #          module load bioinfo-ifb
 #          module load orthofinder/3.0.1b1   (if available as a module)
 #
-#   CIRAD: --partition=cpu-dedicated  --account=dedicated-cpu@cirad-normal
-#          module load bioinfo-cirad
-#          module load orthofinder/3.0.1b1
+#   CIRAD (meso.umontpellier.fr): --partition=cpu-dedicated  --account=dedicated-cpu@cirad-normal
+#          module load bioinfo-ifb   (this cluster uses the bioinfo-ifb module tree, not bioinfo-cirad)
+#          module load orthofinder/3.1.0   (confirmed available version -- 3.0.1b1 is not on this cluster;
+#                                            check `module avail orthofinder` on any new cluster before assuming a version)
 #
 #   Conda installation (recommended — see INSTALLATION section in README.md):
 #          conda activate orthofinder_env
@@ -75,8 +76,11 @@
 # MODULE LOADING — adapt to your cluster
 # ==============================================================================
 module load bioinfo-ifb          # [CLUSTER] change or remove if using conda
-# module load orthofinder/3.0.1b1  # [CLUSTER] uncomment if available as module
-# conda activate orthofinder_env   # [CLUSTER] uncomment if using conda
+module load orthofinder/3.1.0    # [CLUSTER] this loads OrthoFinder itself -- without this (or the
+                                  # conda line below), the script fails with "OrthoFinder not found".
+                                  # Version confirmed on CIRAD (meso.umontpellier.fr); run
+                                  # `module avail orthofinder` and adjust before using a new cluster.
+# conda activate orthofinder_env   # [CLUSTER] uncomment if using conda instead of the module above
 # ==============================================================================
 
 set -euo pipefail
@@ -153,6 +157,8 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 [ -n "$PROTEOMES_DIR" ] || die "--proteomes is required"
 [ -n "$OUTPUT_DIR" ]    || die "--outdir is required"
 [ -d "$PROTEOMES_DIR" ] || die "Proteomes directory not found: $PROTEOMES_DIR"
+[ -e "$OUTPUT_DIR" ]    && die "--outdir must NOT already exist -- OrthoFinder creates it itself " \
+    "and refuses to write into a pre-existing directory (delete/rename $OUTPUT_DIR and retry)"
 
 N_SPECIES=$(find "$PROTEOMES_DIR" -maxdepth 1 \
     \( -name "*.fa" -o -name "*.fasta" -o -name "*.faa" \) | wc -l)
@@ -162,7 +168,12 @@ N_SPECIES=$(find "$PROTEOMES_DIR" -maxdepth 1 \
 command -v orthofinder &>/dev/null || \
     die "OrthoFinder not found. Check module loading, conda env, or PATH."
 
-mkdir -p "$OUTPUT_DIR"
+# Only ensure the *parent* of $OUTPUT_DIR exists -- OrthoFinder's own `-o` flag
+# creates $OUTPUT_DIR itself and errors out ("non-default output directory
+# already exists") if it's already there, even if empty. `mkdir -p
+# "$OUTPUT_DIR"` here used to make every run fail immediately, regardless of
+# what the caller did beforehand.
+mkdir -p "$(dirname "$OUTPUT_DIR")"
 
 # ── Banner ────────────────────────────────────────────────────────────────────
 echo "======================================================"
