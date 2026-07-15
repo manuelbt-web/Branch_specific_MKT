@@ -20,9 +20,13 @@ export PATH="$HOME/reads2snp_2.0:$PATH"
 
 # Usage instructions
 if [ $# -lt 3 ]; then
-    echo "Usage: $0 <bam_list_path> <reference_fasta> <output_directory>"
+    echo "Usage: $0 <bam_list_path> <reference_fasta> <output_directory> [output_prefix]"
     echo "Example:"
     echo "  sbatch $0 /path/to/bam_list.txt /path/to/reference.fasta /path/to/output"
+    echo "  sbatch $0 /path/to/bam_list.txt /path/to/reference.fasta /path/to/output tauschii"
+    echo ""
+    echo "output_prefix defaults to the basename of <output_directory> if omitted"
+    echo "(e.g. output_directory=.../read2snp/tauschii -> prefix 'tauschii')."
     exit 1
 fi
 
@@ -30,6 +34,7 @@ fi
 BAM_LIST="$1"
 REFERENCE="$2"
 OUTPUT_DIR="$3"
+OUTPUT_PREFIX="${4:-$(basename "$OUTPUT_DIR")}"
 
 # Analysis parameters (customize as needed)
 FIS_VALUE=0.18
@@ -38,7 +43,7 @@ echo "=== Analysis Parameters ==="
 echo "BAM list: ${BAM_LIST}"
 echo "Reference genome: ${REFERENCE}"
 echo "Output directory: ${OUTPUT_DIR}"
-echo "TH2 threshold: ${TH2_VALUE}"
+echo "Output prefix: ${OUTPUT_PREFIX}"
 echo "FIS threshold: ${FIS_VALUE}"
 echo ""
 
@@ -64,7 +69,7 @@ reads2snp_2.0.64.bin \
     -bamref "${REFERENCE}" \
     -nbth 1 \
     -fis "${FIS_VALUE}" \
-    -out "${OUTPUT_DIR}/urartu"
+    -out "${OUTPUT_DIR}/${OUTPUT_PREFIX}"
 
 # Check exit status
 if [ $? -eq 0 ]; then
