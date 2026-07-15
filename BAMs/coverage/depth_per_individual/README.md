@@ -34,7 +34,17 @@ A parallel processing pipeline that converts multiple BAM files into a unified d
 
 ## Usage
 
+**Cluster:** SLURM — edit the `[CLUSTER]` lines in `depth_per_individual.sbatch`
+before submission (account, partition, module names).
+
 ### Basic Command
 ```bash
-./depth_per_individual_table.sh /path/to/bams /path/to/output_dir
+sbatch depth_per_individual.sbatch /path/to/bams /path/to/output_dir
+```
+
+Can also be run directly with bash (e.g. on a non-SLURM system, after
+removing the `#SBATCH` header and `module load` lines):
+```bash
+bash depth_per_individual.sbatch /path/to/bams /path/to/output_dir
+```
 
