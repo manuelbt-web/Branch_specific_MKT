@@ -12,8 +12,14 @@ applied to four wild *Aegilops*/*Triticum* species.
 |-------|--------|-------|
 | 1 | Fisher exact test (two-sided + one-sided) | Pathway-level PN/PS/DN/DS |
 | 2 | Benjamini-Hochberg FDR correction | Layer 1 p-values |
-| 3 | Stratified permutation (length-matched null) | MKT gene pool |
-| 4 | Jackknife leave-one-gene-out | Gene-level data (optional) |
+| 3 | Stratified permutation (length- and pathway-overlap-matched null) | MKT gene pool, or `gene_level_file` if provided (recommended) |
+| 4 | Jackknife leave-one-gene-out | `gene_level_file` (recommended — see below) |
+| — | Candidate gene × significant-pathway enrichment test | `gene_level_file` + branch-specific candidates |
+
+**Providing a `gene_level_file` per species is strongly recommended** — see
+[Input file format](#input-file-format) below. Without it, Layer 3 falls back
+to a conservative length-only null (no pathway-overlap control) and Layers 4
+and the enrichment test are skipped entirely.
 
 ---
 
@@ -54,24 +60,28 @@ install.packages(c("tidyverse", "kableExtra", "patchwork", "rmarkdown"))
 SPECIES_LIST <- list(
 
   speltoides = list(
-    label      = "Ae. speltoides",
-    input_file = "input_2DNS_speltoides.csv",  # in this folder
-    output_dir = "results/speltoides"           # from render_analysis.R
+    label           = "Ae. speltoides",
+    input_file      = "input_2DNS_speltoides.csv",  # in this folder
+    output_dir      = "results/speltoides",          # from render_analysis.R
+    gene_level_file = "genes_stats_speltoides_pathways.csv"  # recommended, see below
   ),
   mutica = list(
-    label      = "Ae. mutica",
-    input_file = "input_2DNS_mutica.csv",
-    output_dir = "results/mutica"
+    label           = "Ae. mutica",
+    input_file      = "input_2DNS_mutica.csv",
+    output_dir      = "results/mutica",
+    gene_level_file = "genes_stats_mutica_pathways.csv"
   ),
   tauschii = list(
-    label      = "Ae. tauschii",
-    input_file = "input_2DNS_tauschii.csv",
-    output_dir = "results/tauschii"
+    label           = "Ae. tauschii",
+    input_file      = "input_2DNS_tauschii.csv",
+    output_dir      = "results/tauschii",
+    gene_level_file = "genes_stats_tauschii_pathways.csv"
   ),
   urartu = list(
-    label      = "T. urartu",
-    input_file = "input_2DNS_urartu.csv",
-    output_dir = "results/urartu"
+    label           = "T. urartu",
+    input_file      = "input_2DNS_urartu.csv",
+    output_dir      = "results/urartu",
+    gene_level_file = "genes_stats_urartu_pathways.csv"
   )
 
 )
@@ -116,17 +126,40 @@ Used to:
 - Build the permutation gene pool (all MKT-analyzable genes with their PN/PS/DN/DS)
 - Identify BS candidate genes (`pos_branch_specific_*` columns)
 
-### `gene_level_file` (optional, for Layer 4 jackknife)
+### `gene_level_file` (optional, but recommended for every species)
 
-Not included by default. If provided, must contain one row per gene per pathway:
+Not included by default — this repo ships one per species anyway
+(`genes_stats_speltoides_pathways.csv`, etc.) that already has the right
+format; point `gene_level_file` at it. One row per gene per pathway a gene
+belongs to (genes in >1 pathway repeat over multiple rows):
 
 | Column | Description |
 |--------|-------------|
 | `gene_id` | Gene identifier |
 | `pathway_name` | KEGG pathway name |
 | `PN`, `PS`, `DN`, `DS` | Per-gene counts |
+| `length` | Coding length (used for pathway-specific length stratification in Layer 3) |
 
 Add to `SPECIES_LIST` as `gene_level_file = "genes_stats_speltoides_pathways.csv"`.
+
+Supplying this file changes three things, not just the jackknife:
+1. **Layer 3 permutation** draws its length-stratum targets from the
+   *observed pathway's own* gene-length composition (not the overall pool),
+   and resamples genes weighted by how many pathways each one belongs to
+   ("pathway degree") — so a pathway sharing many genes with other pathways
+   isn't treated as if all its genes were equally exchangeable with any
+   random gene. This is what "controlling for pathway size, gene-length
+   composition, and pathway overlap structure" means in practice, and it is
+   required to reproduce the published pathway counts (without it, Layer 3
+   over-estimates how many pathways survive permutation).
+2. **Layer 4 jackknife** becomes available (as before).
+3. **The candidate × pathway enrichment test** becomes available: whether
+   branch-specific candidate genes (`pos_branch_specific_*` in
+   `branch_specific_MKT_results.tsv`) are over-represented among the genes
+   that make up pathways significant at each layer, restricted to genes with
+   a KEGG annotation (a candidate gene with no pathway annotation can never
+   appear in a pathway, and is correctly excluded from the test rather than
+   silently counted as "not enriched").
 
 ---
 
@@ -141,6 +174,8 @@ All written to `results/2dns/`:
 | `permutation_results.tsv` | Layer 3 permutation results (Fisher-significant pathways) |
 | `comprehensive_summary.tsv` | All layers combined per pathway |
 | `candidates.tsv` | BS candidate genes identified from MKT results |
+| `candidate_pathway_enrichment.tsv` | Enrichment test: candidate genes vs. significant-pathway membership, per layer (written only if `gene_level_file` was supplied for >= 1 species) |
+| `candidate_pathway_presence.tsv` | Per-candidate-gene detail: which pathway(s) it belongs to and whether those pass each layer |
 
 ---
 
@@ -158,16 +193,27 @@ All written to `results/2dns/`:
 ## Permutation null model
 
 The permutation null tests whether the observed pathway-level MK signal is
-stronger than expected when sampling the same number of genes from the background
-pool of all MKT-analyzable genes. Sampling is stratified by gene length (proxy:
-total coding sites from `branch_specific_MKT_results.tsv`) using
-N quantile-based strata (default: 5; set via `LENGTH_STRATA_N` in the launcher).
+stronger than expected when sampling the same number of genes from a
+background pool, stratified by gene length using N quantile-based strata
+(default: 5; set via `LENGTH_STRATA_N` in the launcher).
 
-Because gene-to-pathway membership is not encoded in
-`branch_specific_MKT_results.tsv`, the stratification uses the overall pool
-length distribution (not pathway-specific). This is a valid conservative null
-model. A gene-level pathway CSV (`gene_level_file`) would enable exact
-pathway-specific stratification and the jackknife layer.
+**With a `gene_level_file` (recommended, used whenever supplied):** the
+background pool and length strata are built from that file. The permutation
+target for each stratum comes from the *observed pathway's own* gene-length
+composition, and genes are resampled with probability proportional to how
+many pathways they belong to (their "degree" in the gene↔pathway bipartite
+graph) — controlling for pathway size, gene-length composition, **and**
+pathway overlap structure simultaneously. This is the method that reproduces
+the published pathway counts.
+
+**Without a `gene_level_file`:** gene-to-pathway membership isn't available
+from `branch_specific_MKT_results.tsv` alone, so the pool is built from that
+file instead, using the *overall* pool length distribution (not
+pathway-specific) with no degree-weighting. This is a valid but more
+conservative null model — expect it to retain more pathways as significant
+than the method above, since it doesn't discount hub genes shared across
+many pathways. Layer 4 (jackknife) and the candidate/pathway enrichment test
+also require `gene_level_file` and are skipped without it.
 
 ---
 

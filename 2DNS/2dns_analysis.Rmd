@@ -133,6 +133,58 @@ build_gene_pool <- function(mkt) {
     distinct(gene_id, .keep_all = TRUE)
 }
 
+# ── Pathway-overlap-aware pool + stratification (used when gene_level_file is
+# supplied) ─────────────────────────────────────────────────────────────────
+#
+# The simple `build_gene_pool()` / `run_permutation()` pair above treats the
+# permutation null as "any analyzable gene, matched on length only" — a
+# conservative approximation used when gene-to-pathway membership isn't
+# available. When a `gene_level_file` IS supplied (gene_id, pathway_name,
+# PN, PS, DN, DS, length), two refinements become possible and are used
+# instead:
+#   1. Genes that belong to many pathways ("hubs") are more likely to be
+#      resampled, matching the actual overlap structure of the pathway
+#      universe rather than treating every gene as equally exchangeable.
+#   2. The permutation target for each length stratum is drawn from the
+#      OBSERVED pathway's own gene-length composition, not the overall pool.
+# This mirrors the methodology in `2DNS_gene_set_MK_fisher_REFINED.Rmd`
+# (the script that actually produced the published pathway counts) and is
+# what "controlling for pathway size, gene-length composition, and pathway
+# overlap structure" refers to in the manuscript text.
+
+build_gene_pool_refined <- function(gene_level_data, length_breaks = NULL) {
+  degree_lookup <- gene_level_data %>%
+    transmute(gene_id = as.character(gene_id), pathway_name = as.character(pathway_name)) %>%
+    filter(!is.na(gene_id), gene_id != "", !is.na(pathway_name), pathway_name != "") %>%
+    distinct(gene_id, pathway_name) %>%
+    count(gene_id, name = "gene_degree")
+
+  gene_level_data %>%
+    transmute(
+      gene_id = as.character(gene_id), length = as.numeric(length),
+      PN = as.numeric(PN), PS = as.numeric(PS), DN = as.numeric(DN), DS = as.numeric(DS)
+    ) %>%
+    filter(!is.na(gene_id), gene_id != "") %>%
+    distinct(gene_id, .keep_all = TRUE) %>%
+    filter(if_all(c(length, PN, PS, DN, DS), is.finite)) %>%
+    left_join(degree_lookup, by = "gene_id") %>%
+    mutate(
+      gene_degree    = dplyr::coalesce(as.numeric(gene_degree), 1),
+      length_stratum = assign_length_strata(length, length_breaks)
+    )
+}
+
+build_pathway_length_profile <- function(gene_level_data, pathway_id, length_breaks) {
+  gene_level_data %>%
+    filter(pathway_name == pathway_id) %>%
+    transmute(gene_id = as.character(gene_id), length = as.numeric(length)) %>%
+    filter(!is.na(gene_id), gene_id != "", is.finite(length)) %>%
+    distinct(gene_id, .keep_all = TRUE) %>%
+    mutate(length_stratum = assign_length_strata(length, length_breaks)) %>%
+    count(length_stratum, name = "target_n") %>%
+    arrange(length_stratum)
+}
+
 # ── Analysis layers ────────────────────────────────────────────────────────────
 
 run_fisher_analysis <- function(tbl, species, min_genes = 8L) {
@@ -209,6 +261,53 @@ run_permutation <- function(obs_row, gene_pool, length_breaks, n_perm = 1000L) {
       cands <- pool %>% filter(length_stratum == s)
       if (nrow(cands) == 0) cands <- pool
       cands %>% slice_sample(n = n_s, replace = n_s > nrow(cands))
+    }))
+    mk_statistic(sum(sampled$PN), sum(sampled$PS), sum(sampled$DN), sum(sampled$DS))
+  }, numeric(1))
+
+  tibble(
+    n_permutations   = n_perm,
+    observed_stat    = obs_stat,
+    perm_p_one_sided = (1 + sum(perm_stats >= obs_stat, na.rm = TRUE)) / (n_perm + 1),
+    perm_p_two_sided = (1 + sum(abs(perm_stats) >= abs(obs_stat), na.rm = TRUE)) / (n_perm + 1),
+    perm_stat_median = median(perm_stats, na.rm = TRUE),
+    perm_stat_q025   = unname(quantile(perm_stats, 0.025, na.rm = TRUE)),
+    perm_stat_q975   = unname(quantile(perm_stats, 0.975, na.rm = TRUE))
+  )
+}
+
+# Permutation null, pathway-overlap-aware version (used when gene_level_data
+# is available for this species). Same statistic and continuity-corrected
+# empirical p-values as run_permutation() above, but: (1) the length-stratum
+# targets come from the OBSERVED PATHWAY's own gene composition rather than
+# the overall pool, and (2) genes are resampled with probability proportional
+# to their pathway degree, so highly-shared "hub" genes are appropriately
+# more likely to be redrawn. This is what reproduces the published pathway
+# counts (2DNS_gene_set_MK_fisher_REFINED.Rmd); run_permutation() above
+# remains as a documented conservative fallback for species without a
+# gene_level_file.
+run_permutation_refined <- function(obs_row, gene_pool, gene_level_data, length_breaks, n_perm = 1000L) {
+  obs_stat <- mk_statistic(obs_row$PN, obs_row$PS, obs_row$DN, obs_row$DS)
+  target_profile <- build_pathway_length_profile(gene_level_data, obs_row$pathways, length_breaks)
+
+  na_row <- tibble(
+    n_permutations = n_perm, observed_stat = obs_stat,
+    perm_p_one_sided = NA_real_, perm_p_two_sided = NA_real_,
+    perm_stat_median = NA_real_, perm_stat_q025 = NA_real_, perm_stat_q975 = NA_real_
+  )
+
+  if (!is.finite(obs_stat) || nrow(target_profile) == 0 || nrow(gene_pool) == 0)
+    return(na_row)
+
+  perm_stats <- vapply(seq_len(n_perm), function(i) {
+    sampled <- bind_rows(lapply(seq_len(nrow(target_profile)), function(j) {
+      s     <- target_profile$length_stratum[j]
+      n_s   <- target_profile$target_n[j]
+      cands <- gene_pool %>% filter(length_stratum == s)
+      if (nrow(cands) == 0) cands <- gene_pool
+      w <- as.numeric(cands$gene_degree)
+      if (all(!is.finite(w)) || sum(w, na.rm = TRUE) <= 0) w <- NULL
+      cands %>% slice_sample(n = n_s, replace = n_s > nrow(cands), weight_by = w)
     }))
     mk_statistic(sum(sampled$PN), sum(sampled$PS), sum(sampled$DN), sum(sampled$DS))
   }, numeric(1))
@@ -310,7 +409,14 @@ length_breaks_list <- setNames(lapply(species_names, function(sp) {
   make_length_breaks(gene_pools[[sp]]$length, params$length_strata_n)
 }), species_names)
 
-# Optional gene-level pathway data for jackknife (user-provided)
+# Gene-level pathway data (gene_id, pathway_name, PN, PS, DN, DS, length).
+# Powers three things when supplied: the jackknife (Layer 4), the
+# pathway-overlap-aware permutation null (gene_pools_refined below — the
+# method that reproduces the published pathway counts), and the candidate
+# gene x significant-pathway enrichment test (see "Candidate genes within
+# robust pathways" section). Without it, the pipeline still runs but Layer 3
+# falls back to the conservative length-only null and Layer 4 + the
+# enrichment test are skipped.
 gene_level_data <- setNames(lapply(species_names, function(sp) {
   glf <- species_cfg[[sp]]$gene_level_file
   if (is.null(glf) || !file.exists(glf)) return(NULL)
@@ -318,6 +424,21 @@ gene_level_data <- setNames(lapply(species_names, function(sp) {
 }), species_names)
 
 jackknife_available <- any(sapply(gene_level_data, Negate(is.null)))
+
+# Pathway-overlap-aware pool + length breaks, built from gene_level_data when
+# available. `length_breaks_refined_list` is recomputed from this pool (not
+# reused from `length_breaks_list`) so that, when only some species supply a
+# gene_level_file, each species' strata are still drawn from its own data.
+gene_pools_refined <- setNames(lapply(species_names, function(sp) {
+  if (is.null(gene_level_data[[sp]])) return(NULL)
+  breaks <- make_length_breaks(gene_level_data[[sp]]$length, params$length_strata_n)
+  build_gene_pool_refined(gene_level_data[[sp]], breaks)
+}), species_names)
+
+length_breaks_refined_list <- setNames(lapply(species_names, function(sp) {
+  if (is.null(gene_level_data[[sp]])) return(NULL)
+  make_length_breaks(gene_level_data[[sp]]$length, params$length_strata_n)
+}), species_names)
 ```
 
 ---
@@ -475,11 +596,21 @@ the same size are drawn from the MKT-analyzable gene pool, stratified by gene
 length (proxy: total coding sites). The empirical p-value is the fraction of
 permuted MK statistics as extreme as the observed value (+1 continuity correction).
 
-**Note:** Because gene-to-pathway membership is not encoded in
-`branch_specific_MKT_results.tsv`, the length stratification uses the *overall*
-pool distribution rather than the pathway's specific gene composition. This is a
-conservative null model: it controls for gene-length bias without over-matching to
-the observed pathway.
+**When a `gene_level_file` is supplied for a species** (recommended — see
+2DNS/README.md), the null model instead draws each length stratum's target
+count from the *observed pathway's own* gene-length composition, and
+resamples genes with probability proportional to how many pathways they
+belong to ("pathway degree"), so highly-shared genes are appropriately more
+likely to be redrawn. This is the pathway-overlap-aware method that produces
+the published pathway counts.
+
+**Without a `gene_level_file`**, gene-to-pathway membership isn't available
+from `branch_specific_MKT_results.tsv` alone, so the length stratification
+falls back to the *overall* pool distribution rather than the pathway's
+specific gene composition, and no degree-weighting is applied. This
+conservative fallback controls for gene-length bias without over-matching to
+the observed pathway, but does not reproduce the published pathway counts —
+provide a `gene_level_file` whenever one is available.
 
 ```{r perm_run, include=FALSE}
 .perm_empty <- tibble(
@@ -498,12 +629,23 @@ results_perm <- if (nrow(fisher_sig) == 0) {
   bind_rows(lapply(seq_len(nrow(fisher_sig)), function(i) {
     row <- fisher_sig[i, ]
     sp  <- row$species
-    run_permutation(
-      obs_row       = row,
-      gene_pool     = gene_pools[[sp]],
-      length_breaks = length_breaks_list[[sp]],
-      n_perm        = params$n_permutations
-    ) %>%
+    perm_out <- if (!is.null(gene_pools_refined[[sp]])) {
+      run_permutation_refined(
+        obs_row        = row,
+        gene_pool      = gene_pools_refined[[sp]],
+        gene_level_data = gene_level_data[[sp]],
+        length_breaks  = length_breaks_refined_list[[sp]],
+        n_perm         = params$n_permutations
+      )
+    } else {
+      run_permutation(
+        obs_row       = row,
+        gene_pool     = gene_pools[[sp]],
+        length_breaks = length_breaks_list[[sp]],
+        n_perm        = params$n_permutations
+      )
+    }
+    perm_out %>%
       mutate(
         species            = sp,
         pathways           = row$pathways,
@@ -724,10 +866,11 @@ if (nrow(candidates_all) == 0) {
 }
 ```
 
-> **Note:** Pathway membership of individual candidate genes cannot be determined
-> from `branch_specific_MKT_results.tsv` alone. To assess which pathways contain
-> candidate genes, provide a gene-level pathway annotation file via
-> `gene_level_file` in `render_2dns.R`.
+> **Note:** Pathway membership of individual candidate genes cannot be
+> determined from `branch_specific_MKT_results.tsv` alone — it requires a
+> `gene_level_file` (see "Candidate genes within robust pathways" below,
+> after the Comprehensive Summary section, for the enrichment test this
+> enables).
 
 ---
 
@@ -804,6 +947,150 @@ if (nrow(top_pathways) == 0) {
 
 ---
 
+# Candidate genes within robust pathways
+
+Are the branch-specific candidate genes (the same gene-level `is_candidate`
+flag used throughout this report) over-represented among the genes that make
+up the pathways found significant at each layer, or are the two lines of
+evidence largely independent? This requires a `gene_level_file` (gene →
+pathway membership); species without one are skipped below.
+
+```{r candidate_enrichment_run, include=FALSE}
+normalize_gene_id_2dns <- function(x) {
+  x <- stringr::str_remove(as.character(x), "_\\d+_HOG\\d+$")  # our pipeline's gene_id
+  stringr::str_remove(x, "\\.\\d+$")                            # legacy "EVM0000024.1" ids
+}
+
+species_with_gene_level <- species_names[sapply(gene_level_data, Negate(is.null))]
+
+candidate_enrichment_tests <- tibble()
+candidate_pathway_presence <- tibble()
+
+# candidates_all has no "species" column at all (0 rows, 0 cols) when no
+# species had a usable branch_specific_MKT_results.tsv — guard against that
+# before filtering on it, rather than erroring on a missing column.
+has_candidates <- nrow(candidates_all) > 0 && "species" %in% names(candidates_all)
+
+if (length(species_with_gene_level) > 0 && has_candidates) {
+
+  gene_membership_all <- bind_rows(lapply(species_with_gene_level, function(sp) {
+    gene_level_data[[sp]] %>%
+      transmute(species = sp, gene_id_norm = normalize_gene_id_2dns(gene_id),
+                pathway_name = as.character(pathway_name)) %>%
+      filter(!is.na(gene_id_norm), gene_id_norm != "", !is.na(pathway_name), pathway_name != "") %>%
+      distinct()
+  }))
+
+  layer_flags <- summary_all %>%
+    transmute(species, pathways,
+              layer_1_sig = `L1 Fisher` %in% TRUE,
+              layer_3_sig = `L3 Permutation` %in% TRUE,
+              layer_4_sig = `L4 Robust` %in% TRUE)
+
+  candidates_norm <- candidates_all %>%
+    filter(species %in% species_with_gene_level) %>%
+    transmute(species, gene_id_norm = normalize_gene_id_2dns(gene_id)) %>%
+    distinct()
+
+  candidate_pathway_presence <- candidates_norm %>%
+    left_join(gene_membership_all, by = c("species", "gene_id_norm")) %>%
+    left_join(layer_flags, by = c("species", "pathway_name" = "pathways")) %>%
+    mutate(across(c(layer_1_sig, layer_3_sig, layer_4_sig), ~ dplyr::coalesce(.x, FALSE))) %>%
+    group_by(species, gene_id_norm) %>%
+    summarise(
+      mapped_to_pathway = any(!is.na(pathway_name)),
+      in_layer_1 = any(layer_1_sig), in_layer_3 = any(layer_3_sig), in_layer_4 = any(layer_4_sig),
+      pathways_layer_4 = paste(sort(unique(pathway_name[layer_4_sig])), collapse = "; "),
+      .groups = "drop"
+    )
+
+  # Formal enrichment test at each layer: 2x2 table of candidate-gene status
+  # x member-of-a-significant-pathway status, restricted to the universe of
+  # genes with pathway annotation for that species (a candidate with no KEGG
+  # annotation can never appear in a pathway, so it must be excluded from
+  # both margins rather than silently counted as "not enriched").
+  run_enrichment_layer <- function(sp, layer_col) {
+    universe <- gene_membership_all %>% filter(species == sp) %>% pull(gene_id_norm) %>% unique()
+    sig_pathways <- layer_flags %>% filter(species == sp, .data[[layer_col]]) %>% pull(pathways)
+    genes_in_sig <- gene_membership_all %>%
+      filter(species == sp, pathway_name %in% sig_pathways) %>% pull(gene_id_norm) %>% unique()
+    cand <- candidates_norm %>% filter(species == sp) %>% pull(gene_id_norm) %>% intersect(universe)
+
+    a <- length(intersect(cand, genes_in_sig))
+    b <- length(setdiff(cand, genes_in_sig))
+    c <- length(setdiff(genes_in_sig, cand))
+    d <- length(setdiff(universe, union(cand, genes_in_sig)))
+
+    if (length(sig_pathways) == 0 || length(cand) == 0) {
+      return(tibble(species = sp, layer = layer_col, n_sig_pathways = length(sig_pathways),
+                     n_universe = length(universe), n_candidates_annotated = length(cand),
+                     n_overlap = a, pct_overlap = NA_real_, pct_expected = NA_real_,
+                     odds_ratio = NA_real_, p_two_sided = NA_real_, p_one_sided = NA_real_))
+    }
+
+    ft2 <- safe_fisher(matrix(c(a, b, c, d), nrow = 2, byrow = TRUE), "two.sided")
+    ft1 <- safe_fisher(matrix(c(a, b, c, d), nrow = 2, byrow = TRUE), "greater")
+
+    tibble(
+      species = sp, layer = layer_col, n_sig_pathways = length(sig_pathways),
+      n_universe = length(universe), n_candidates_annotated = length(cand), n_overlap = a,
+      pct_overlap  = 100 * a / length(cand),
+      pct_expected = 100 * length(genes_in_sig) / length(universe),
+      odds_ratio = ft2$estimate, p_two_sided = ft2$p.value, p_one_sided = ft1$p.value
+    )
+  }
+
+  candidate_enrichment_tests <- bind_rows(lapply(species_with_gene_level, function(sp) {
+    bind_rows(
+      run_enrichment_layer(sp, "layer_1_sig"),
+      run_enrichment_layer(sp, "layer_3_sig"),
+      run_enrichment_layer(sp, "layer_4_sig")
+    )
+  })) %>%
+    mutate(layer = recode(layer, layer_1_sig = "L1 Fisher", layer_3_sig = "L3 Permutation",
+                           layer_4_sig = "L4 Robust (final)"))
+}
+```
+
+```{r candidate_enrichment_table}
+if (length(species_with_gene_level) == 0) {
+  cat("Skipped — no species has a `gene_level_file` configured.\n")
+} else if (nrow(candidate_enrichment_tests) == 0) {
+  cat("No candidate genes with pathway annotation to test.\n")
+} else {
+  candidate_enrichment_tests %>%
+    mutate(
+      `% candidates in sig. pathway`   = round(pct_overlap, 1),
+      `% expected (pathway coverage)`  = round(pct_expected, 1),
+      `Odds ratio` = round(odds_ratio, 2),
+      `p (two-sided)` = formatC(p_two_sided, format = "e", digits = 2),
+      `p (one-sided, enrichment)` = formatC(p_one_sided, format = "e", digits = 2)
+    ) %>%
+    select(Species = species, Layer = layer, `n pathways` = n_sig_pathways,
+           `n candidates (annotated)` = n_candidates_annotated, `n overlap` = n_overlap,
+           `% candidates in sig. pathway`, `% expected (pathway coverage)`,
+           `Odds ratio`, `p (two-sided)`, `p (one-sided, enrichment)`) %>%
+    styled_kable(caption = paste(
+      "Enrichment of candidate genes among members of significant pathways,",
+      "at each layer. The one-sided test asks specifically whether candidates",
+      "are OVER-represented (not just different) relative to that layer's",
+      "genome-wide pathway coverage."
+    ))
+}
+```
+
+```{r candidate_enrichment_genes}
+if (nrow(candidate_pathway_presence) > 0) {
+  candidate_pathway_presence %>%
+    filter(in_layer_4) %>%
+    arrange(species, gene_id_norm) %>%
+    select(Species = species, `Gene ID` = gene_id_norm, `Pathway(s), Layer 4 (final)` = pathways_layer_4) %>%
+    styled_kable(caption = "Candidate genes that also belong to a Layer-4 (jackknife-robust) pathway")
+}
+```
+
+---
+
 # Output files
 
 ```{r write_outputs}
@@ -827,11 +1114,21 @@ if (nrow(candidates_all) > 0)
   write_tsv(candidates_all,
             file.path(params$output_dir, "candidates.tsv"),          na = "NA")
 
+# Candidate x pathway enrichment (only written when >=1 species has a gene_level_file)
+if (nrow(candidate_enrichment_tests) > 0)
+  write_tsv(candidate_enrichment_tests,
+            file.path(params$output_dir, "candidate_pathway_enrichment.tsv"), na = "NA")
+if (nrow(candidate_pathway_presence) > 0)
+  write_tsv(candidate_pathway_presence,
+            file.path(params$output_dir, "candidate_pathway_presence.tsv"), na = "NA")
+
 cat("TSV outputs written to:", params$output_dir, "\n",
     " - fisher_results.tsv\n",
     " - permutation_results.tsv\n",
     " - comprehensive_summary.tsv\n",
-    " - candidates.tsv\n")
+    " - candidates.tsv\n",
+    " - candidate_pathway_enrichment.tsv (if any species had a gene_level_file)\n",
+    " - candidate_pathway_presence.tsv (if any species had a gene_level_file)\n")
 ```
 
 ---

@@ -63,8 +63,13 @@ if (length(missing_pkgs) > 0)
 #   output_dir     : from branch_specific_MKT/render_analysis.R
 #                    (reads branch_specific_MKT_results.tsv for gene pool +
 #                     candidate identification)
-#   gene_level_file: (optional) gene-level pathway CSV for jackknife Layer 4.
-#                    Set to NULL or omit to skip the jackknife.
+#   gene_level_file: gene-level pathway CSV (gene_id, pathway_name, PN, PS,
+#                    DN, DS, length). Strongly recommended for every species:
+#                    without it, Layer 3's permutation null can't control for
+#                    pathway overlap structure (over-estimates significant
+#                    pathways), and Layer 4 (jackknife) plus the candidate x
+#                    pathway enrichment test are skipped. Set to NULL to
+#                    fall back to the conservative length-only null instead.
 #
 # File paths are relative to the 2DNS/ folder (resolved automatically).
 
@@ -74,28 +79,28 @@ SPECIES_LIST <- list(
     label           = "Ae. speltoides",
     input_file      = "input_2DNS_speltoides.csv",
     output_dir      = "results/speltoides",        # from render_analysis.R
-    gene_level_file = NULL                         # optional; NULL = skip jackknife
+    gene_level_file = "genes_stats_speltoides_pathways.csv"
   ),
 
   mutica = list(
     label           = "Ae. mutica",
     input_file      = "input_2DNS_mutica.csv",
     output_dir      = "results/mutica",
-    gene_level_file = NULL
+    gene_level_file = "genes_stats_mutica_pathways.csv"
   ),
 
   tauschii = list(
     label           = "Ae. tauschii",
     input_file      = "input_2DNS_tauschii.csv",
     output_dir      = "results/tauschii",
-    gene_level_file = NULL
+    gene_level_file = "genes_stats_tauschii_pathways.csv"
   ),
 
   urartu = list(
     label           = "T. urartu",
     input_file      = "input_2DNS_urartu.csv",
     output_dir      = "results/urartu",
-    gene_level_file = NULL
+    gene_level_file = "genes_stats_urartu_pathways.csv"
   )
 
 )
